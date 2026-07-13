@@ -52,6 +52,31 @@ Example:
   window managers/compositors can silently stop delivering redraws to a
   long-lived window without any error - this bounds how long the graph can
   stay frozen instead of the rest of a multi-hour ferment.
+- `YOGURT_GRAPH_DIAG_LOG` - path to the graph diagnostics log (default
+  `graph_diagnostics.log` in the working directory; empty string disables it)
+- `YOGURT_GRAPH_DIAG_HEARTBEAT_SECONDS` - how often a heartbeat line is
+  written (default `300`)
+- `YOGURT_GRAPH_DIAG_SLOW_MS` - a single redraw call taking longer than this
+  is logged immediately (default `250`)
+
+## Diagnosing a frozen graph
+
+Every run writes `graph_diagnostics.log`: a `GRAPH_CREATED` line at startup
+and after every proactive refresh (with the matplotlib backend and Qt
+platform in use), a `HEARTBEAT` line every 5 minutes (temperature, setpoint,
+redraw count/timing, point count, `fig_stale`), and an immediate
+`SLOW_REDRAW` line if any single redraw call takes more than 250 ms. This
+distinguishes two very different failure modes: a slow/hung redraw *call*
+(a real Python-level problem, would show as `SLOW_REDRAW` or a gap in
+heartbeats) versus the window silently no longer being repainted on screen
+while Python sees nothing wrong (no anomaly in the log at all - the redraw
+calls keep returning normally and quickly, they just aren't reaching the
+screen). If the graph looks frozen during a run, **note the wall-clock time**
+and check the log afterwards: heartbeats with fast, steady `max_redraw_ms`
+around that time mean the freeze was invisible to the process (a
+window-manager/compositor-side issue - the proactive refresh should recover
+it within `YOGURT_GRAPH_REFRESH_SECONDS`), while a gap in heartbeats or a
+`SLOW_REDRAW`/exception would point at a real in-process hang instead.
 
 ## Tests
 

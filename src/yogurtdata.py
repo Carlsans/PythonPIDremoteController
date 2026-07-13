@@ -52,6 +52,17 @@ class YogourtFermenter():
         # See recreategraph() for why this exists.
         self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 30 * 60))
         self.graphrecreatecount = 0
+        # Diagnostic log for the graph-freeze investigation: timing of every
+        # redraw call plus periodic heartbeats, so a run that visually froze
+        # can be correlated afterwards with what the process actually saw.
+        # Empty string disables it.
+        self.diaglogpath = os.environ.get('YOGURT_GRAPH_DIAG_LOG',
+                                          os.getcwd() + "/graph_diagnostics.log")
+        self.diagheartbeatseconds = float(os.environ.get('YOGURT_GRAPH_DIAG_HEARTBEAT_SECONDS', 5 * 60))
+        self.diagslowredrawms = float(os.environ.get('YOGURT_GRAPH_DIAG_SLOW_MS', 250))
+        self.diaglastheartbeat = 0.0
+        self.diagredrawcount = 0
+        self.diagmaxredrawms = 0.0
         self.setPidvalues()
         self.networkconf = NetworkConfiguration()
         self.createsocket()
@@ -70,6 +81,30 @@ class YogourtFermenter():
 
         if autorun:
             self.listeningloop()
+
+    def diaglog(self, message):
+        if not self.diaglogpath:
+            return
+        try:
+            with open(self.diaglogpath, 'a') as f:
+                f.write(datetime.datetime.now().isoformat(sep=' ', timespec='milliseconds')
+                        + " | " + message + "\n")
+        except OSError:
+            pass  # diagnostics must never be able to break the fermentation run
+
+    def graphbackendinfo(self):
+        import matplotlib
+        backend = matplotlib.get_backend()
+        qpa = os.environ.get('QT_QPA_PLATFORM', '')
+        if not qpa:
+            try:
+                from matplotlib.backends.qt_compat import QtWidgets
+                app = QtWidgets.QApplication.instance()
+                if app is not None:
+                    qpa = app.platformName()
+            except Exception:
+                qpa = ''
+        return backend, qpa or 'n/a'
 
     def createsocket(self):
         old_sock = getattr(self, 'sock', None)
@@ -130,6 +165,10 @@ class YogourtFermenter():
         self.ax1.legend()
         self.ax2.legend()
         self.fig.show()  # show the window (figure will be in foreground, but the user may move it to background)
+        backend, qpa = self.graphbackendinfo()
+        self.diaglog("GRAPH_CREATED backend=" + backend + " qpa=" + qpa
+                     + " refresh_s=" + str(self.graphrefreshseconds)
+                     + " recreate_count=" + str(self.graphrecreatecount))
 
     def recreategraph(self):
         """Close and reopen the graph window.
@@ -143,6 +182,7 @@ class YogourtFermenter():
         long the graph can stay frozen to that interval instead of the rest
         of a multi-hour/multi-day fermentation run.
         """
+        self.diaglog("RECREATE_SCHEDULED age_s=" + str(round(time.time() - self.lastgraphrecreate, 1)))
         try:
             plt.close(self.fig)
         except Exception as e:
@@ -207,12 +247,38 @@ class YogourtFermenter():
             # updating a plot from a custom loop (as opposed to FuncAnimation)
             # and is required for some window managers/compositors to
             # actually service the redraw.
+            drawstart = time.monotonic()
             self.fig.canvas.draw_idle()
             plt.pause(0.001)
+            drawms = (time.monotonic() - drawstart) * 1000
+            self.diagredrawcount += 1
+            self.diagmaxredrawms = max(self.diagmaxredrawms, drawms)
+            if drawms > self.diagslowredrawms:
+                # A slow call here means the draw/event-loop call itself
+                # hung inside Python - as opposed to the window silently not
+                # repainting on screen while Python sees nothing wrong.
+                # Distinguishing those two is the whole point of this log.
+                self.diaglog("SLOW_REDRAW dt_ms=" + str(round(drawms, 1)) + " n_points=" + str(n))
+            self.diagheartbeat()
         except Exception as e:
             # Never let a drawing problem (e.g. window closed mid-draw) take
             # down the control loop.
             print("Plotting error (ignored):", e)
+            self.diaglog("ANIMATE_EXCEPTION " + repr(e))
+
+    def diagheartbeat(self):
+        now = time.time()
+        if now - self.diaglastheartbeat < self.diagheartbeatseconds:
+            return
+        self.diaglastheartbeat = now
+        self.diaglog("HEARTBEAT temp=" + str(self.currenttemp) + " sp=" + str(self.currentSP)
+                     + " cv=" + str(self.currentCV) + " redraws=" + str(self.diagredrawcount)
+                     + " max_redraw_ms=" + str(round(self.diagmaxredrawms, 1))
+                     + " points=" + str(len(self.tempbysec))
+                     + " fig_stale=" + str(self.fig.stale)
+                     + " recreate_count=" + str(self.graphrecreatecount))
+        self.diagredrawcount = 0
+        self.diagmaxredrawms = 0.0
 
     def appendnewtemperatureevent(self,message):
         message = message.replace("Sensor temp: ","")

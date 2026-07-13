@@ -5,4 +5,5 @@ src/__pycache__
 yogurt_settings.json
 autotune_results.txt
 yogurtpid2.csv
+graph_diagnostics.log
 __pycache__/

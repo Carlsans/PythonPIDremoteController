@@ -49,8 +49,11 @@ class YogourtFermenter():
         self.connectionlostseconds = float(os.environ.get('YOGURT_CONNECTION_TIMEOUT', 30))
         self.lastpackettime = time.time()
         # Proactively recreate the graph window this often (0 disables it).
-        # See recreategraph() for why this exists.
-        self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 30 * 60))
+        # See recreategraph() for why this exists. Off by default: recreating
+        # raises/refocuses the window, which is disruptive on its own, and no
+        # freeze has actually been observed yet - use the GUI's "Refresh
+        # graph" button (or call recreategraph() directly) if one ever is.
+        self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 0))
         self.graphrecreatecount = 0
         # Diagnostic log for the graph-freeze investigation: timing of every
         # redraw call plus periodic heartbeats, so a run that visually froze

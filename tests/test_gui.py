@@ -167,7 +167,18 @@ def test_start_stop(gui):
     # the fermenter (with heater off); scheduled before start because
     # startprogram() blocks until the loop ends.
     capturedprogress = []
+    buttonstateswhilerunning = []
+    recreatecountbeforeclick = []
+    recreatecountafterclick = []
+
+    def clickrefresh():
+        buttonstateswhilerunning.append(gui.refreshgraphbutton.instate(["!disabled"]))
+        recreatecountbeforeclick.append(gui.fermenter.graphrecreatecount)
+        gui.refreshgraph()
+        recreatecountafterclick.append(gui.fermenter.graphrecreatecount)
+
     gui.root.after(1500, lambda: capturedprogress.append(gui.progressvar.get()))
+    gui.root.after(1700, clickrefresh)
     gui.root.after(3000, lambda: gui.stop(heateroff=True))
     gui.startprogram()
     stopflag.append(True)
@@ -179,6 +190,11 @@ def test_start_stop(gui):
     assert any("SetSP(1)" in r for r in received), "'Stop & heater off' did not send SetSP(1)"
     assert not gui.running and gui.fermenter is None
     assert gui.startbutton.instate(["!disabled"]), "start button not re-enabled after stop"
+
+    assert buttonstateswhilerunning == [True], "refresh graph button was not enabled while running"
+    assert recreatecountbeforeclick == [0], "unexpected automatic graph recreation (should default to off)"
+    assert recreatecountafterclick == [1], "clicking 'Refresh graph' did not recreate the graph"
+    assert gui.refreshgraphbutton.instate(["disabled"]), "refresh graph button not disabled after stop"
 
     assert capturedprogress, "progress display was never captured while running"
     progresstext = capturedprogress[0]

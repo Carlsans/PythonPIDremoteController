@@ -295,11 +295,19 @@ class YogurtGUI:
         self.stopoffbutton = ttk.Button(frame, text="Stop & heater off", state="disabled",
                                         command=lambda: self.stop(heateroff=True))
         self.stopoffbutton.grid(row=0, column=2, padx=4)
+        self.refreshgraphbutton = ttk.Button(frame, text="Refresh graph", state="disabled",
+                                             command=self.refreshgraph)
+        self.refreshgraphbutton.grid(row=0, column=3, padx=4)
         self.statusvar = tk.StringVar(value="Idle")
-        ttk.Label(frame, textvariable=self.statusvar).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(frame, textvariable=self.statusvar).grid(row=1, column=0, columnspan=4, sticky="w", pady=4)
 
     def setstatus(self, text):
         self.statusvar.set(text)
+
+    def refreshgraph(self):
+        if self.fermenter is None:
+            return
+        self.fermenter.recreategraph()
 
     def startprogram(self):
         if self.running:
@@ -323,6 +331,7 @@ class YogurtGUI:
         self.autotunebutton["state"] = "disabled"
         self.stopbutton["state"] = "normal"
         self.stopoffbutton["state"] = "normal"
+        self.refreshgraphbutton["state"] = "normal"
         self.setstatus(statustext)
         try:
             self.fermenter = YogourtFermenter(ontick=self.ontick, autorun=False, **kwargs)
@@ -337,6 +346,7 @@ class YogurtGUI:
                 self.autotunebutton["state"] = "normal"
                 self.stopbutton["state"] = "disabled"
                 self.stopoffbutton["state"] = "disabled"
+                self.refreshgraphbutton["state"] = "disabled"
                 self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
                 self.progressvar.set("Idle - nothing running")
         if self.closing:

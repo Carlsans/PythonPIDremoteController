@@ -22,6 +22,11 @@ The control panel starts, configures and stops everything (run from the project 
   keeps holding the target. Use water, not milk.
 - **Start program / Stop**: "Stop (keep heating)" leaves the MCU holding its last
   setpoint (the MCU is autonomous); "Stop & heater off" sends SetSP(1) first.
+- **Refresh graph**: manually closes and reopens the graph window. Automatic
+  periodic refresh is off by default (see `YOGURT_GRAPH_REFRESH_SECONDS`
+  below) since it raises/refocuses the window, which is disruptive on its
+  own; use this button (or the diagnostics log) if the graph ever actually
+  looks frozen.
 
 ## Modes
 
@@ -47,11 +52,13 @@ Example:
 - `YOGURT_LISTEN_PORT` - port this program listens on (default: same as `YOGURT_ESP_PORT`)
 - `YOGURT_CONNECTION_TIMEOUT` - seconds without any packet before the UDP socket is
   recreated (default `30`)
-- `YOGURT_GRAPH_REFRESH_SECONDS` - the graph window is proactively closed and
-  reopened this often (default `1800`, i.e. 30 min; `0` disables it). Some
-  window managers/compositors can silently stop delivering redraws to a
-  long-lived window without any error - this bounds how long the graph can
-  stay frozen instead of the rest of a multi-hour ferment.
+- `YOGURT_GRAPH_REFRESH_SECONDS` - if set above `0`, the graph window is
+  proactively closed and reopened this often (default `0`, disabled). Some
+  window managers/compositors can in theory silently stop delivering redraws
+  to a long-lived window without any error, which this would bound - but it
+  also raises/refocuses the window on every reload, which is disruptive on
+  its own, so it is off unless you set it. Use the GUI's "Refresh graph"
+  button (or `fermenter.recreategraph()`) to do it manually instead.
 - `YOGURT_GRAPH_DIAG_LOG` - path to the graph diagnostics log (default
   `graph_diagnostics.log` in the working directory; empty string disables it)
 - `YOGURT_GRAPH_DIAG_HEARTBEAT_SECONDS` - how often a heartbeat line is

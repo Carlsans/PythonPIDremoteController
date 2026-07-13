@@ -16,6 +16,7 @@ events. This keeps everything single-threaded (tkinter and matplotlib both
 dislike background threads).
 """
 
+import copy
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -41,6 +42,7 @@ class YogurtGUI:
         self.buildautotunesection(body)
         self.buildrunsection(body)
         self.refreshstages()
+        self.refreshprograms()
         self.refreshprofiles()
 
     # ------------------------------------------------------------------
@@ -64,6 +66,13 @@ class YogurtGUI:
         self.stageminutesentry.grid(row=1, column=3)
         ttk.Button(frame, text="Add stage", command=self.addstage).grid(row=1, column=4, padx=4)
         ttk.Button(frame, text="Remove selected", command=self.removestage).grid(row=1, column=5, padx=4)
+
+        ttk.Label(frame, text="Saved programs:").grid(row=2, column=0, pady=4)
+        self.programbox = ttk.Combobox(frame, width=18)
+        self.programbox.grid(row=2, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Button(frame, text="Save", command=self.saveprogram).grid(row=2, column=3, padx=2)
+        ttk.Button(frame, text="Load", command=self.loadprogram).grid(row=2, column=4, padx=2)
+        ttk.Button(frame, text="Delete", command=self.deleteprogram).grid(row=2, column=5, padx=2)
 
     def refreshstages(self):
         self.stagetree.delete(*self.stagetree.get_children())
@@ -97,6 +106,46 @@ class YogurtGUI:
             del self.settings["stages"][index]
         self.store.save(self.settings)
         self.refreshstages()
+
+    # ------------------------------------------------------------------
+    # Saved stage programs
+    # ------------------------------------------------------------------
+    def refreshprograms(self):
+        self.programbox["values"] = sorted(self.settings["stage_programs"].keys())
+
+    def saveprogram(self):
+        name = self.programbox.get().strip()
+        if not name:
+            messagebox.showerror("Save program", "Give the program a name in the 'Saved programs' box.")
+            return
+        if not self.settings["stages"]:
+            messagebox.showerror("Save program", "Add at least one stage first.")
+            return
+        self.settings["stage_programs"][name] = copy.deepcopy(self.settings["stages"])
+        self.store.save(self.settings)
+        self.refreshprograms()
+        self.setstatus("Saved stage program '" + name + "'")
+
+    def loadprogram(self):
+        name = self.programbox.get().strip()
+        program = self.settings["stage_programs"].get(name)
+        if program is None:
+            messagebox.showerror("Load program", "No saved program named '" + name + "'.")
+            return
+        self.settings["stages"] = copy.deepcopy(program)
+        self.store.save(self.settings)
+        self.refreshstages()
+        self.setstatus("Loaded stage program '" + name + "'")
+
+    def deleteprogram(self):
+        name = self.programbox.get().strip()
+        if name not in self.settings["stage_programs"]:
+            return
+        del self.settings["stage_programs"][name]
+        self.store.save(self.settings)
+        self.refreshprograms()
+        self.programbox.set("")
+        self.setstatus("Deleted stage program '" + name + "'")
 
     # ------------------------------------------------------------------
     # PID profiles

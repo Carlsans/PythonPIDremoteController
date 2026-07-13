@@ -71,6 +71,44 @@ def test_stages(gui):
     print("OK - stages add/remove/save")
 
 
+def test_stageprograms(gui):
+    # test_stages left stages = [82/10, 40/480]; the default greek-yogurt
+    # program must also be offered.
+    assert "greek-yogurt" in gui.programbox["values"]
+
+    gui.programbox.set("my-program")
+    gui.saveprogram()
+    assert storedsettings()["stage_programs"]["my-program"] == \
+        [{"temperature": 82.0, "duration_minutes": 10.0},
+         {"temperature": 40.0, "duration_minutes": 480.0}]
+
+    # Mangle the working stages, then restore from the saved program.
+    gui.stagetree.selection_set(gui.stagetree.get_children()[0])
+    gui.removestage()
+    assert len(storedsettings()["stages"]) == 1
+    gui.loadprogram()
+    assert storedsettings()["stages"] == \
+        [{"temperature": 82.0, "duration_minutes": 10.0},
+         {"temperature": 40.0, "duration_minutes": 480.0}]
+
+    # Loading must give an independent copy: editing stages afterwards must
+    # not silently change the saved program.
+    gui.stagetempentry.delete(0, "end")
+    gui.stageminutesentry.delete(0, "end")
+    gui.stagetempentry.insert(0, "50")
+    gui.stageminutesentry.insert(0, "5")
+    gui.addstage()
+    assert len(storedsettings()["stage_programs"]["my-program"]) == 2
+
+    gui.deleteprogram()
+    assert "my-program" not in storedsettings()["stage_programs"]
+
+    # Restore the two-stage working set for the following tests.
+    gui.programbox.set("greek-yogurt")
+    gui.loadprogram()
+    print("OK - stage programs save/load/delete")
+
+
 def test_profiles(gui):
     gui.profilebox.set("water-test")
     for key, value in (("Kp", "55.5"), ("Ki", "0.111"), ("Kd", "0")):
@@ -146,6 +184,7 @@ def main():
     gui.root.update()
     try:
         test_stages(gui)
+        test_stageprograms(gui)
         test_profiles(gui)
         test_start_stop(gui)
     finally:

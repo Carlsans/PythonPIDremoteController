@@ -9,6 +9,13 @@ DEFAULTSETTINGS = {
     "stages": [
         {"temperature": 39.0, "duration_minutes": 24 * 60},
     ],
+    # Named snapshots of stage lists, restorable from the GUI.
+    "stage_programs": {
+        "greek-yogurt": [
+            {"temperature": 82.0, "duration_minutes": 10.0},
+            {"temperature": 39.0, "duration_minutes": 8 * 60.0},
+        ],
+    },
     # Named PID tunings. These are the hand tunings that used to be hardcoded
     # (and commented) in PIDProgram.py, one per pot setup.
     "pid_profiles": {

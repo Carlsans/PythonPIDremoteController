@@ -13,6 +13,8 @@ The control panel starts, configures and stops everything (run from the project 
 - **Program stages**: add/remove stages (heat to a temperature, then hold it for a
   duration). Example for Greek yogurt: 82 C held 10 min (texture + sanitizing),
   then 40 C held 480 min. Stages are saved to `yogurt_settings.json`.
+  The current stage list can be saved under a name (e.g. "greek-yogurt") and
+  restored later with the Save/Load/Delete buttons.
 - **PID tunings**: named profiles (save/select/delete). The selected profile is
   applied when the program starts.
 - **Autotune**: enter a target temperature and a profile name, press Start

@@ -47,6 +47,11 @@ Example:
 - `YOGURT_LISTEN_PORT` - port this program listens on (default: same as `YOGURT_ESP_PORT`)
 - `YOGURT_CONNECTION_TIMEOUT` - seconds without any packet before the UDP socket is
   recreated (default `30`)
+- `YOGURT_GRAPH_REFRESH_SECONDS` - the graph window is proactively closed and
+  reopened this often (default `1800`, i.e. 30 min; `0` disables it). Some
+  window managers/compositors can silently stop delivering redraws to a
+  long-lived window without any error - this bounds how long the graph can
+  stay frozen instead of the rest of a multi-hour ferment.
 
 ## Tests
 
@@ -59,6 +64,12 @@ the real device:
     ./venvarch/bin/python tests/test_gui.py
 
     ./venvarch/bin/python tests/test_overshoot_fix.py
+
+`tests/test_graph_refresh.py` needs a real display (it drives the actual
+interactive graph window, not the headless Agg backend used by the tests
+above) - run it manually when checking graph-refresh behaviour:
+
+    ./venvarch/bin/python tests/test_graph_refresh.py
 
 Two scripts talk to the real device (run them only with water in the pot; both
 turn the heater off at the end):

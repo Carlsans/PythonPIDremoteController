@@ -48,6 +48,10 @@ class YogourtFermenter():
         # dead and the UDP socket is recreated.
         self.connectionlostseconds = float(os.environ.get('YOGURT_CONNECTION_TIMEOUT', 30))
         self.lastpackettime = time.time()
+        # Proactively recreate the graph window this often (0 disables it).
+        # See recreategraph() for why this exists.
+        self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 30 * 60))
+        self.graphrecreatecount = 0
         self.setPidvalues()
         self.networkconf = NetworkConfiguration()
         self.createsocket()
@@ -102,6 +106,7 @@ class YogourtFermenter():
         if plt.get_fignums():
             print("Graphic already opened")
             return
+        self.lastgraphrecreate = time.time()
         style.use('fivethirtyeight')
 
         self.fig , ((self.ax1, self.ax2),(self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(10, 5))
@@ -126,8 +131,30 @@ class YogourtFermenter():
         self.ax2.legend()
         self.fig.show()  # show the window (figure will be in foreground, but the user may move it to background)
 
+    def recreategraph(self):
+        """Close and reopen the graph window.
+
+        Some window managers/compositors can stop delivering redraw frames
+        to a long-lived window without the process ever seeing an error (no
+        crash, no exception - the control loop keeps running fine while the
+        graph just silently stops updating on screen). There is no reliable
+        way to detect that from inside matplotlib, so instead the window is
+        proactively recreated every `graphrefreshseconds`; this bounds how
+        long the graph can stay frozen to that interval instead of the rest
+        of a multi-hour/multi-day fermentation run.
+        """
+        try:
+            plt.close(self.fig)
+        except Exception as e:
+            print("Could not close stale graph (ignored):", e)
+        self.graphrecreatecount += 1
+        self.creategraph()
 
     def animate(self):
+
+        if self.graphrefreshseconds > 0 and hasattr(self, 'lastgraphrecreate') \
+                and time.time() - self.lastgraphrecreate > self.graphrefreshseconds:
+            self.recreategraph()
 
         if not plt.get_fignums():
             print("No graph")
@@ -172,7 +199,16 @@ class YogourtFermenter():
             self.ax3.autoscale_view()  # automatic axis scaling
             self.ax4.relim()  # recompute the data limits
             self.ax4.autoscale_view()  # automatic axis scaling
-            self.fig.canvas.flush_events()
+            # draw_idle() explicitly requests a redraw (flush_events() alone
+            # only polls already-queued window-system events, it does not
+            # request one). plt.pause() then gives the GUI toolkit's event
+            # loop actual time to run, instead of a single non-blocking poll -
+            # this is the pattern matplotlib's own docs recommend for
+            # updating a plot from a custom loop (as opposed to FuncAnimation)
+            # and is required for some window managers/compositors to
+            # actually service the redraw.
+            self.fig.canvas.draw_idle()
+            plt.pause(0.001)
         except Exception as e:
             # Never let a drawing problem (e.g. window closed mid-draw) take
             # down the control loop.

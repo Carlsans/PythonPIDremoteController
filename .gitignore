@@ -2,3 +2,7 @@ src/.stfolder
 src/__pycache__
 .idea
 
+yogurt_settings.json
+autotune_results.txt
+yogurtpid2.csv
+__pycache__/

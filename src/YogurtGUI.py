@@ -1,0 +1,308 @@
+"""Control panel for the yogurt fermenter.
+
+Run from the project root:
+    python -m src.YogurtGUI
+
+Features:
+- edit the fermentation program (stages: temperature + hold duration),
+  saved to yogurt_settings.json,
+- save/select/delete named PID tunings,
+- run a relay autotune and save the resulting tunings under a chosen name,
+- start/stop the fermentation program (the matplotlib graph opens as usual).
+
+Design note: the fermenter's listening loop runs in this same thread and
+calls back into ontick() several times per second, which pumps tkinter
+events. This keeps everything single-threaded (tkinter and matplotlib both
+dislike background threads).
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+from src.SettingsStore import SettingsStore
+from src.yogurtdata import YogourtFermenter
+
+
+class YogurtGUI:
+    def __init__(self, settingsstore=None):
+        self.store = settingsstore if settingsstore is not None else SettingsStore()
+        self.settings = self.store.load()
+        self.fermenter = None
+        self.running = False
+        self.closing = False
+
+        self.root = tk.Tk()
+        self.root.title("Yogurt Fermenter")
+        self.root.protocol("WM_DELETE_WINDOW", self.onclose)
+        body = ttk.Frame(self.root, padding=10)
+        body.grid(sticky="nsew")
+        self.buildstagesection(body)
+        self.buildpidsection(body)
+        self.buildautotunesection(body)
+        self.buildrunsection(body)
+        self.refreshstages()
+        self.refreshprofiles()
+
+    # ------------------------------------------------------------------
+    # Program stages
+    # ------------------------------------------------------------------
+    def buildstagesection(self, parent):
+        frame = ttk.LabelFrame(parent, text="Program stages (heat to temp, then hold for duration)", padding=8)
+        frame.grid(row=0, column=0, sticky="ew", pady=4)
+        self.stagetree = ttk.Treeview(frame, columns=("temp", "minutes"), show="headings", height=4)
+        self.stagetree.heading("temp", text="Temperature (C)")
+        self.stagetree.heading("minutes", text="Hold (minutes)")
+        self.stagetree.column("temp", width=140, anchor="center")
+        self.stagetree.column("minutes", width=140, anchor="center")
+        self.stagetree.grid(row=0, column=0, columnspan=6, sticky="ew")
+
+        ttk.Label(frame, text="Temp (C):").grid(row=1, column=0, pady=4)
+        self.stagetempentry = ttk.Entry(frame, width=7)
+        self.stagetempentry.grid(row=1, column=1)
+        ttk.Label(frame, text="Hold (min):").grid(row=1, column=2)
+        self.stageminutesentry = ttk.Entry(frame, width=7)
+        self.stageminutesentry.grid(row=1, column=3)
+        ttk.Button(frame, text="Add stage", command=self.addstage).grid(row=1, column=4, padx=4)
+        ttk.Button(frame, text="Remove selected", command=self.removestage).grid(row=1, column=5, padx=4)
+
+    def refreshstages(self):
+        self.stagetree.delete(*self.stagetree.get_children())
+        for stage in self.settings["stages"]:
+            self.stagetree.insert("", "end", values=(stage["temperature"], stage["duration_minutes"]))
+
+    def addstage(self):
+        try:
+            temperature = float(self.stagetempentry.get())
+            minutes = float(self.stageminutesentry.get())
+        except ValueError:
+            messagebox.showerror("Invalid stage", "Temperature and hold minutes must be numbers.")
+            return
+        if not 0 < temperature <= 95:
+            messagebox.showerror("Invalid stage", "Temperature must be between 0 and 95 C.")
+            return
+        if minutes < 0:
+            messagebox.showerror("Invalid stage", "Hold minutes cannot be negative.")
+            return
+        self.settings["stages"].append({"temperature": temperature, "duration_minutes": minutes})
+        self.store.save(self.settings)
+        self.refreshstages()
+
+    def removestage(self):
+        selected = self.stagetree.selection()
+        if not selected:
+            messagebox.showinfo("Remove stage", "Select a stage to remove first.")
+            return
+        indexes = sorted((self.stagetree.index(item) for item in selected), reverse=True)
+        for index in indexes:
+            del self.settings["stages"][index]
+        self.store.save(self.settings)
+        self.refreshstages()
+
+    # ------------------------------------------------------------------
+    # PID profiles
+    # ------------------------------------------------------------------
+    def buildpidsection(self, parent):
+        frame = ttk.LabelFrame(parent, text="PID tunings (named profiles)", padding=8)
+        frame.grid(row=1, column=0, sticky="ew", pady=4)
+        ttk.Label(frame, text="Profile:").grid(row=0, column=0)
+        self.profilebox = ttk.Combobox(frame, width=24)
+        self.profilebox.grid(row=0, column=1, columnspan=3, sticky="w", padx=4)
+        self.profilebox.bind("<<ComboboxSelected>>", self.onprofileselected)
+
+        self.pidentries = {}
+        for column, name in enumerate(("Kp", "Ki", "Kd")):
+            ttk.Label(frame, text=name + ":").grid(row=1, column=column * 2)
+            entry = ttk.Entry(frame, width=10)
+            entry.grid(row=1, column=column * 2 + 1, padx=4, pady=4)
+            self.pidentries[name] = entry
+        ttk.Button(frame, text="Save profile", command=self.saveprofile).grid(row=2, column=1, pady=4)
+        ttk.Button(frame, text="Delete profile", command=self.deleteprofile).grid(row=2, column=3, pady=4)
+
+    def refreshprofiles(self):
+        names = sorted(self.settings["pid_profiles"].keys())
+        self.profilebox["values"] = names
+        active = self.settings.get("active_profile")
+        if active not in self.settings["pid_profiles"]:
+            active = names[0] if names else ""
+            self.settings["active_profile"] = active
+        self.profilebox.set(active)
+        self.loadprofileentries(active)
+
+    def loadprofileentries(self, name):
+        profile = self.settings["pid_profiles"].get(name)
+        if profile is None:
+            return
+        for key, entry in self.pidentries.items():
+            entry.delete(0, "end")
+            entry.insert(0, str(profile[key]))
+
+    def onprofileselected(self, event=None):
+        name = self.profilebox.get()
+        self.settings["active_profile"] = name
+        self.loadprofileentries(name)
+        self.store.save(self.settings)
+
+    def currenttunings(self):
+        return tuple(float(self.pidentries[k].get()) for k in ("Kp", "Ki", "Kd"))
+
+    def saveprofile(self):
+        name = self.profilebox.get().strip()
+        if not name:
+            messagebox.showerror("Save profile", "Give the profile a name in the Profile box.")
+            return
+        try:
+            kp, ki, kd = self.currenttunings()
+        except ValueError:
+            messagebox.showerror("Save profile", "Kp, Ki and Kd must be numbers.")
+            return
+        self.settings["pid_profiles"][name] = {"Kp": kp, "Ki": ki, "Kd": kd}
+        self.settings["active_profile"] = name
+        self.store.save(self.settings)
+        self.refreshprofiles()
+        self.setstatus("Saved profile '" + name + "'")
+
+    def deleteprofile(self):
+        name = self.profilebox.get().strip()
+        if name not in self.settings["pid_profiles"]:
+            return
+        if len(self.settings["pid_profiles"]) == 1:
+            messagebox.showerror("Delete profile", "Cannot delete the last profile.")
+            return
+        del self.settings["pid_profiles"][name]
+        self.store.save(self.settings)
+        self.refreshprofiles()
+        self.setstatus("Deleted profile '" + name + "'")
+
+    def saveautotuneresult(self, label, result):
+        """Store an autotune result as a named profile (called when it finishes)."""
+        if result is None:
+            self.setstatus("Autotune aborted - nothing saved. Check the terminal output.")
+            return
+        tunings = result[result.get("applied", "ziegler_nichols_pi")]
+        self.settings["pid_profiles"][label] = {
+            "Kp": tunings["Kp"], "Ki": tunings["Ki"], "Kd": tunings["Kd"]}
+        self.settings["active_profile"] = label
+        self.store.save(self.settings)
+        self.refreshprofiles()
+        self.setstatus("Autotune done: saved profile '" + label + "'. Now holding the target temperature.")
+
+    # ------------------------------------------------------------------
+    # Autotune
+    # ------------------------------------------------------------------
+    def buildautotunesection(self, parent):
+        frame = ttk.LabelFrame(parent, text="Autotune (relay method - use water, not milk)", padding=8)
+        frame.grid(row=2, column=0, sticky="ew", pady=4)
+        ttk.Label(frame, text="Target (C):").grid(row=0, column=0)
+        self.autotunetargetentry = ttk.Entry(frame, width=7)
+        self.autotunetargetentry.insert(0, "40")
+        self.autotunetargetentry.grid(row=0, column=1, padx=4)
+        ttk.Label(frame, text="Save as profile:").grid(row=0, column=2)
+        self.autotunelabelentry = ttk.Entry(frame, width=18)
+        self.autotunelabelentry.grid(row=0, column=3, padx=4)
+        self.autotunebutton = ttk.Button(frame, text="Start autotune", command=self.startautotune)
+        self.autotunebutton.grid(row=0, column=4, padx=4)
+
+    def startautotune(self):
+        if self.running:
+            return
+        try:
+            target = float(self.autotunetargetentry.get())
+        except ValueError:
+            messagebox.showerror("Autotune", "Target temperature must be a number.")
+            return
+        if not 20 <= target <= 90:
+            messagebox.showerror("Autotune", "Target must be between 20 and 90 C.")
+            return
+        label = self.autotunelabelentry.get().strip()
+        if not label:
+            label = "autotune-" + str(target) + "C"
+        self.runfermenter("Autotuning at " + str(target) + " C (profile '" + label + "')...",
+                          mode='relayautotune', autotunetarget=target,
+                          onautotunedone=lambda result: self.saveautotuneresult(label, result))
+
+    # ------------------------------------------------------------------
+    # Run / stop
+    # ------------------------------------------------------------------
+    def buildrunsection(self, parent):
+        frame = ttk.Frame(parent, padding=8)
+        frame.grid(row=3, column=0, sticky="ew", pady=4)
+        self.startbutton = ttk.Button(frame, text="Start program", command=self.startprogram)
+        self.startbutton.grid(row=0, column=0, padx=4)
+        self.stopbutton = ttk.Button(frame, text="Stop (keep heating)", state="disabled",
+                                     command=lambda: self.stop(heateroff=False))
+        self.stopbutton.grid(row=0, column=1, padx=4)
+        self.stopoffbutton = ttk.Button(frame, text="Stop & heater off", state="disabled",
+                                        command=lambda: self.stop(heateroff=True))
+        self.stopoffbutton.grid(row=0, column=2, padx=4)
+        self.statusvar = tk.StringVar(value="Idle")
+        ttk.Label(frame, textvariable=self.statusvar).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+
+    def setstatus(self, text):
+        self.statusvar.set(text)
+
+    def startprogram(self):
+        if self.running:
+            return
+        if not self.settings["stages"]:
+            messagebox.showerror("Start program", "Add at least one stage first.")
+            return
+        try:
+            tunings = self.currenttunings()
+        except ValueError:
+            messagebox.showerror("Start program", "Kp, Ki and Kd must be numbers.")
+            return
+        self.store.save(self.settings)
+        self.runfermenter("Program running (profile '" + self.profilebox.get() + "')...",
+                          mode='pidprogram', stages=list(self.settings["stages"]),
+                          tunings=tunings)
+
+    def runfermenter(self, statustext, **kwargs):
+        self.running = True
+        self.startbutton["state"] = "disabled"
+        self.autotunebutton["state"] = "disabled"
+        self.stopbutton["state"] = "normal"
+        self.stopoffbutton["state"] = "normal"
+        self.setstatus(statustext)
+        try:
+            self.fermenter = YogourtFermenter(ontick=self.ontick, autorun=False, **kwargs)
+            self.fermenter.listeningloop()  # blocks; ontick keeps the GUI alive
+        except Exception as e:
+            messagebox.showerror("Fermenter stopped", str(e))
+        finally:
+            self.running = False
+            self.fermenter = None
+            if not self.closing:
+                self.startbutton["state"] = "normal"
+                self.autotunebutton["state"] = "normal"
+                self.stopbutton["state"] = "disabled"
+                self.stopoffbutton["state"] = "disabled"
+                self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
+        if self.closing:
+            self.root.destroy()
+
+    def ontick(self):
+        if self.closing:
+            if self.fermenter is not None:
+                self.fermenter.stoprequested = True
+            return
+        self.root.update()
+
+    def stop(self, heateroff=False):
+        if self.fermenter is None:
+            return
+        if heateroff:
+            self.fermenter.setSP(1)
+            self.setstatus("Heater off requested, stopping...")
+        self.fermenter.stoprequested = True
+
+    def onclose(self):
+        self.closing = True
+        if not self.running:
+            self.root.destroy()
+        # If running, ontick() will stop the loop and runfermenter() destroys
+        # the window on the way out.
+
+
+if __name__ == '__main__':
+    gui = YogurtGUI()
+    gui.root.mainloop()

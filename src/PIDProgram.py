@@ -15,6 +15,7 @@ class PIDProgram:
                  ramprate=0.5 / 60.0, rampzone=10.0):
         self.controller = controller
         self.now = timesource
+        self.programstarttime = self.now()
         if tunings is None:
             tunings = (20, .02, .4)  # "medium-pot-5-jars" profile
         # The firmware uses the aggressive profile while |SP - temp| >= 4.5 C
@@ -68,6 +69,43 @@ class PIDProgram:
         if self.overridepid[self.currentstage]:
             self.controller.setPIDOverride()
 
+    def getprogress(self):
+        """Snapshot of where the program is, for display in the GUI.
+
+        `stage_remaining_s`/`total_remaining_s` only count hold time (once a
+        stage's target is reached, how long until it moves on); the time
+        spent heating up to a target is not predictable (it depends on the
+        pot, the ambient temperature, how full it is...), so it is not
+        included and the "heating" phase is shown instead as open-ended.
+        """
+        totalelapsed = self.now() - self.programstarttime
+        ended = not self.currentstage <= len(self.temperatures) - 1
+        if ended:
+            return {"ended": True, "phase": "ended",
+                    "stage_index": len(self.temperatures) - 1,
+                    "stage_count": len(self.temperatures),
+                    "target": self.temperatures[-1] if self.temperatures else None,
+                    "total_elapsed_s": totalelapsed,
+                    "stage_elapsed_s": None, "stage_remaining_s": 0.0,
+                    "total_remaining_s": 0.0}
+        stageduration = self.waitsecondsaftertempreached[self.currentstage]
+        if self.temperaturehasbeenreached:
+            phase = "holding"
+            stageremaining = max(0.0, self.startnextsteptime - self.now())
+            stageelapsed = stageduration - stageremaining
+        else:
+            phase = "heating"
+            stageremaining = stageduration
+            stageelapsed = 0.0
+        futureholds = sum(self.waitsecondsaftertempreached[self.currentstage + 1:])
+        return {"ended": False, "phase": phase,
+                "stage_index": self.currentstage,
+                "stage_count": len(self.temperatures),
+                "target": self.temperatures[self.currentstage],
+                "total_elapsed_s": totalelapsed,
+                "stage_elapsed_s": stageelapsed, "stage_remaining_s": stageremaining,
+                "total_remaining_s": stageremaining + futureholds}
+
     def playchime(self, sound):
         try:
             sound()
@@ -119,7 +157,14 @@ class PIDProgram:
         # final value to the MCU (during the ramp, SP < target and the water
         # tracking the ramp must not end the stage early).
         rampdone = self.controller.SP == self.temperatures[self.currentstage]
-        # Temperature is reached
+        # Temperature is reached: start the hold timer. currentstage is NOT
+        # advanced here - it always refers to the stage currently being
+        # approached/held, advancing only once that stage's hold duration has
+        # actually elapsed (below). Advancing it here instead (as this used
+        # to) pushes the index out of range the instant the LAST stage's
+        # target is reached, making the program report "ended" - and skip
+        # that stage's completion chime - without ever honoring its hold
+        # duration.
         if rampdone and self.controller.currenttemp  + self.temperaturetolerance>= self.controller.SP and self.controller.currenttemp - self.temperaturetolerance <= self.controller.SP and not self.temperaturehasbeenreached:
             self.temperaturehasbeenreached = True
             self.startnextsteptime = self.now() + self.waitsecondsaftertempreached[self.currentstage]
@@ -127,16 +172,18 @@ class PIDProgram:
             if self.effects[self.currentstage] == "chime":
                 self.playchime(chime.info)
 
-            self.currentstage += 1
-
-        # Temperature is reached and wait time ended
-        if self.temperaturehasbeenreached and self.now() >= self.startnextsteptime and self.currentstage <= len(self.temperatures)-1:
+        # Temperature is reached and wait time ended: advance to the next
+        # stage, or finish the program if this was the last one.
+        if self.temperaturehasbeenreached and self.now() >= self.startnextsteptime:
             self.temperaturehasbeenreached = False
             self.rampstart = None  # the new stage plans its own approach ramp
-            self.controller.setSP(self.temperatures[self.currentstage])
-            self.controller.overridepid = self.overridepid[self.currentstage]
-            if self.overridepid[self.currentstage]:
-                self.controller.setPIDOverride()
-            print("Waiting time ended, next target temperature :",self.controller.SP)
-            if self.effects[self.currentstage] == "chime":
+            finishedstage = self.currentstage
+            self.currentstage += 1
+            if self.effects[finishedstage] == "chime":
                 self.playchime(chime.success)
+            if self.currentstage <= len(self.temperatures) - 1:
+                self.controller.setSP(self.temperatures[self.currentstage])
+                self.controller.overridepid = self.overridepid[self.currentstage]
+                if self.overridepid[self.currentstage]:
+                    self.controller.setPIDOverride()
+                print("Waiting time ended, next target temperature :",self.controller.SP)

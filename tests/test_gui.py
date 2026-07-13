@@ -163,8 +163,11 @@ def test_start_stop(gui):
 
     espthread = threading.Thread(target=fakeesp, daemon=True)
     espthread.start()
-    # Stop the fermenter (with heater off) after 3 s of running; scheduled
-    # before start because startprogram() blocks until the loop ends.
+    # Capture the live progress display partway through the run, then stop
+    # the fermenter (with heater off); scheduled before start because
+    # startprogram() blocks until the loop ends.
+    capturedprogress = []
+    gui.root.after(1500, lambda: capturedprogress.append(gui.progressvar.get()))
     gui.root.after(3000, lambda: gui.stop(heateroff=True))
     gui.startprogram()
     stopflag.append(True)
@@ -176,7 +179,15 @@ def test_start_stop(gui):
     assert any("SetSP(1)" in r for r in received), "'Stop & heater off' did not send SetSP(1)"
     assert not gui.running and gui.fermenter is None
     assert gui.startbutton.instate(["!disabled"]), "start button not re-enabled after stop"
-    print("OK - start program / stop & heater off cycle")
+
+    assert capturedprogress, "progress display was never captured while running"
+    progresstext = capturedprogress[0]
+    assert "Stage 1/2" in progresstext, progresstext
+    assert "heating" in progresstext.lower(), progresstext  # fake ESP holds temp at 35, never reaches 82
+    assert "Total elapsed" in progresstext, progresstext
+    assert gui.progressvar.get() == "Idle - nothing running", \
+        "progress display did not reset after stop"
+    print("OK - start program / stop & heater off cycle, progress display")
 
 
 def main():

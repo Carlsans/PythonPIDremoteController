@@ -120,6 +120,32 @@ def main():
     ratio = tunerclamped.result['Ku'] / result['Ku']
     assert 0.8 < ratio < 1.25, "clamped-output Ku should match the process Ku (got ratio " + str(round(ratio, 2)) + ")"
 
+    # getprogress(), used by the GUI's progress display.
+    finishedprogress = tuner.getprogress()
+    assert finishedprogress["phase"] == "done"
+    assert finishedprogress["cycles_done"] == finishedprogress["cycles_needed"]
+    assert finishedprogress["target"] == TARGET
+    assert finishedprogress["elapsed_s"] > 0
+
+    midpot = SimulatedPot(ambient=22.0, fullpowerrise=90.0, tau=1500.0, deadtime=20.0)
+    midpid = SimulatedMCUPID()
+    midcontroller = FakeController(midpid)
+    midtuner = RelayAutotune(midcontroller, targettemp=TARGET, maxsafetemp=60.0,
+                             resultsfile=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                      "autotune_results_test2.txt"))
+    for t in range(600):  # short partial run, well before completion
+        output = midpid.compute(measure(midpot))
+        midcontroller.currentoutput = output
+        midpot.step(output)
+        midtuner.update(measure(midpot), now=float(t))
+    midprogress = midtuner.getprogress()
+    assert midprogress["phase"] == "relay"
+    assert 0 <= midprogress["cycles_done"] < midprogress["cycles_needed"]
+    assert midprogress["elapsed_s"] > 0
+    if os.path.exists(midtuner.resultsfile):
+        os.remove(midtuner.resultsfile)
+
+    print("OK - RelayAutotune.getprogress()")
     print("\nOK - relay autotune converges and its tunings control the pot.")
 
 

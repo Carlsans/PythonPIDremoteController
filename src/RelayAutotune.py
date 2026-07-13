@@ -214,6 +214,15 @@ class RelayAutotune:
         except OSError as e:
             print("Could not save autotune results:", e)
 
+    def getprogress(self):
+        """Snapshot of where the autotune is, for display in the GUI."""
+        elapsed = 0.0 if self.starttime is None else self.now() - self.starttime
+        return {"phase": self.state,
+                "elapsed_s": elapsed,
+                "cycles_done": len(self.cyclepeaks),
+                "cycles_needed": self.skipcycles + self.cyclestomeasure,
+                "target": self.targettemp}
+
     def abort(self, reason):
         self.state = 'aborted'
         print("Relay autotune ABORTED:", reason)

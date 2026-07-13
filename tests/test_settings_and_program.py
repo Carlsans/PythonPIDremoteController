@@ -75,7 +75,7 @@ def test_greek_yogurt_program():
         pot.step(output)
         controller.currenttemp = round(pot.temp * 4) / 4.0
         program.applyProgram()
-        if reached82at is None and program.currentstage == 1:
+        if reached82at is None and program.temperaturehasbeenreached:
             reached82at = t
         if reached82at is not None and controller.SP == 82.0:
             maxovershootat82 = max(maxovershootat82, pot.temp - 82.0)
@@ -108,7 +108,80 @@ def test_greek_yogurt_program():
           + str(round(max(finalerrors), 3)) + " C)")
 
 
+def test_progress_reporting():
+    controller = FakeController(SimulatedMCUPID())
+    simtime = {"t": 0.0}
+    stages = [{"temperature": 50.0, "duration_minutes": 5.0},
+              {"temperature": 30.0, "duration_minutes": 2.0}]
+    program = PIDProgram(controller, stages=stages, tunings=(10, 0.01, 0.0),
+                         timesource=lambda: simtime["t"])
+
+    # Heating: stage 0, no hold time consumed yet, total remaining is the
+    # sum of BOTH stages' hold durations (heating time is not predictable
+    # and intentionally excluded).
+    controller.currenttemp = 40.0
+    simtime["t"] = 10.0
+    program.applyProgram()
+    progress = program.getprogress()
+    assert progress == {
+        "ended": False, "phase": "heating", "stage_index": 0, "stage_count": 2,
+        "target": 50.0, "total_elapsed_s": 10.0, "stage_elapsed_s": 0.0,
+        "stage_remaining_s": 5 * 60.0, "total_remaining_s": 5 * 60.0 + 2 * 60.0,
+    }, progress
+
+    # Reach the target: the hold begins. currentstage must NOT advance yet -
+    # this is exactly the bug that used to make the program report "ended"
+    # (and skip the final stage's completion chime) the instant its target
+    # was reached, without ever honoring its hold duration.
+    controller.currenttemp = 50.0
+    simtime["t"] = 11.0
+    program.applyProgram()
+    assert program.temperaturehasbeenreached is True
+    assert program.currentstage == 0, "currentstage must not advance until the hold finishes"
+
+    simtime["t"] = 11.0 + 60.0  # one minute into the 5-minute hold
+    program.applyProgram()
+    progress = program.getprogress()
+    assert progress["phase"] == "holding"
+    assert progress["stage_index"] == 0
+    assert abs(progress["stage_elapsed_s"] - 60.0) < 1e-6
+    assert abs(progress["stage_remaining_s"] - (5 * 60 - 60.0)) < 1e-6
+    assert abs(progress["stage_elapsed_s"] + progress["stage_remaining_s"] - 5 * 60) < 1e-9
+    assert abs(progress["total_remaining_s"] - (progress["stage_remaining_s"] + 2 * 60)) < 1e-9
+
+    # Hold finishes: advances to stage 1 and applies its target.
+    simtime["t"] = 11.0 + 5 * 60 + 1
+    program.applyProgram()
+    assert program.currentstage == 1
+    assert controller.SP == 30.0
+    progress = program.getprogress()
+    assert progress["ended"] is False
+    assert progress["stage_index"] == 1
+    assert progress["target"] == 30.0
+    assert progress["total_remaining_s"] == 2 * 60.0  # only stage 1's hold left
+
+    # Stage 1 (the LAST stage) reaches its target and holds for its full
+    # duration before the program is considered ended - not immediately.
+    controller.currenttemp = 30.0
+    simtime["t"] += 1
+    program.applyProgram()
+    assert program.temperaturehasbeenreached is True
+    progress = program.getprogress()
+    assert progress["ended"] is False, \
+        "must not report ended before the last stage's hold duration elapses"
+    assert progress["phase"] == "holding" and progress["stage_index"] == 1
+
+    simtime["t"] += 2 * 60 + 1
+    program.applyProgram()
+    progress = program.getprogress()
+    assert progress["ended"] is True
+    assert progress["target"] == 30.0
+    assert progress["total_remaining_s"] == 0.0
+    print("OK - PIDProgram.getprogress() (and the last-stage hold-duration fix)")
+
+
 if __name__ == '__main__':
     test_settingsstore()
     test_greek_yogurt_program()
+    test_progress_reporting()
     print("\nOK - all settings/program tests passed.")

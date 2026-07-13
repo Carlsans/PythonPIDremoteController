@@ -17,8 +17,18 @@ dislike background threads).
 """
 
 import copy
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+
+def formatduration(seconds):
+    if seconds is None:
+        return "-"
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return "%d:%02d:%02d" % (hours, minutes, seconds)
 
 from src.SettingsStore import SettingsStore
 from src.yogurtdata import YogourtFermenter
@@ -41,6 +51,8 @@ class YogurtGUI:
         self.buildpidsection(body)
         self.buildautotunesection(body)
         self.buildrunsection(body)
+        self.buildprogresssection(body)
+        self.lastprogressupdate = 0.0
         self.refreshstages()
         self.refreshprograms()
         self.refreshprofiles()
@@ -326,14 +338,57 @@ class YogurtGUI:
                 self.stopbutton["state"] = "disabled"
                 self.stopoffbutton["state"] = "disabled"
                 self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
+                self.progressvar.set("Idle - nothing running")
         if self.closing:
             self.root.destroy()
+
+    # ------------------------------------------------------------------
+    # Progress display
+    # ------------------------------------------------------------------
+    def buildprogresssection(self, parent):
+        frame = ttk.LabelFrame(parent, text="Progress", padding=8)
+        frame.grid(row=4, column=0, sticky="ew", pady=4)
+        self.progressvar = tk.StringVar(value="Idle - nothing running")
+        ttk.Label(frame, textvariable=self.progressvar, justify="left").grid(row=0, column=0, sticky="w")
+
+    def updateprogress(self):
+        now = time.time()
+        if now - self.lastprogressupdate < 1.0:
+            return
+        self.lastprogressupdate = now
+        fermenter = self.fermenter
+        if fermenter is None:
+            return
+        if fermenter.mode == 'pidprogram' and hasattr(fermenter, 'pidprogram'):
+            progress = fermenter.pidprogram.getprogress()
+            if progress["ended"]:
+                text = "Program complete (held " + str(progress["target"]) + " C)"
+            else:
+                stagelabel = "Stage " + str(progress["stage_index"] + 1) + "/" + str(progress["stage_count"])
+                target = str(progress["target"]) + " C"
+                if progress["phase"] == "heating":
+                    text = (stagelabel + ": heating to " + target
+                           + " (current " + str(fermenter.currenttemp) + " C)")
+                else:
+                    text = (stagelabel + ": holding " + target
+                           + "  -  elapsed " + formatduration(progress["stage_elapsed_s"])
+                           + " / remaining " + formatduration(progress["stage_remaining_s"]))
+            text += "\nTotal elapsed: " + formatduration(progress["total_elapsed_s"])
+            text += "   Est. remaining (holds only): " + formatduration(progress["total_remaining_s"])
+            self.progressvar.set(text)
+        elif fermenter.mode == 'relayautotune' and hasattr(fermenter, 'relayautotune'):
+            progress = fermenter.relayautotune.getprogress()
+            text = ("Autotune at " + str(progress["target"]) + " C: " + progress["phase"]
+                   + "  -  cycle " + str(progress["cycles_done"]) + "/" + str(progress["cycles_needed"])
+                   + "\nElapsed: " + formatduration(progress["elapsed_s"]))
+            self.progressvar.set(text)
 
     def ontick(self):
         if self.closing:
             if self.fermenter is not None:
                 self.fermenter.stoprequested = True
             return
+        self.updateprogress()
         self.root.update()
 
     def stop(self, heateroff=False):

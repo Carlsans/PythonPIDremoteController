@@ -9,10 +9,14 @@ DEFAULTSETTINGS = {
     "stages": [
         {"temperature": 39.0, "duration_minutes": 24 * 60},
     ],
-    # Named PID tunings. "medium-pot-5-jars" is the hand tuning that was
-    # hardcoded in PIDProgram.py.
+    # Named PID tunings. These are the hand tunings that used to be hardcoded
+    # (and commented) in PIDProgram.py, one per pot setup.
     "pid_profiles": {
-        "medium-pot-5-jars": {"Kp": 20.0, "Ki": 0.02, "Kd": 0.4},
+        "medium-pot-5-jars": {"Kp": 20.0, "Ki": 0.02, "Kd": 0.4},  # Moyen chaudron fond fin, 5 pots + starter
+        "gros-chaudron-2-masson-2L": {"Kp": 22.0, "Ki": 0.02, "Kd": 0.6},  # Gros chaudron fond fin, 2 pots masson 2L
+        "moyen-chaudron-4-pots": {"Kp": 16.0, "Ki": 0.02, "Kd": 0.1},  # Moyen chaudron fond fin, 4 pots + starter (12 aout 2025)
+        "instant-pot": {"Kp": 12.73, "Ki": 0.009, "Kd": 0.1},  # Chaudron instant pot
+        "petit-chaudron-verre": {"Kp": 3.5, "Ki": 0.005, "Kd": 0.1},  # Petit chaudron de verre (essai)
     },
     "active_profile": "medium-pot-5-jars",
 }

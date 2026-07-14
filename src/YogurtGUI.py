@@ -31,7 +31,7 @@ def formatduration(seconds):
     return "%d:%02d:%02d" % (hours, minutes, seconds)
 
 from src.SettingsStore import SettingsStore
-from src.yogurtdata import YogourtFermenter
+from src.yogurtdata import YogourtFermenter, SingleInstanceError
 
 
 class YogurtGUI:
@@ -307,7 +307,10 @@ class YogurtGUI:
     def refreshgraph(self):
         if self.fermenter is None:
             return
-        self.fermenter.recreategraph()
+        # Not a direct recreategraph() call: see requestgraphrefresh()'s
+        # docstring - doing the actual work from inside this nested button
+        # callback is what a real run showed can hang the whole process.
+        self.fermenter.requestgraphrefresh()
 
     def startprogram(self):
         if self.running:
@@ -336,6 +339,8 @@ class YogurtGUI:
         try:
             self.fermenter = YogourtFermenter(ontick=self.ontick, autorun=False, **kwargs)
             self.fermenter.listeningloop()  # blocks; ontick keeps the GUI alive
+        except SingleInstanceError as e:
+            messagebox.showerror("Another instance is already running", str(e))
         except Exception as e:
             messagebox.showerror("Fermenter stopped", str(e))
         finally:

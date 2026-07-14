@@ -169,16 +169,24 @@ def test_start_stop(gui):
     capturedprogress = []
     buttonstateswhilerunning = []
     recreatecountbeforeclick = []
-    recreatecountafterclick = []
+    recreatecountsoonafterclick = []
+    requestflagimmediatelyafterclick = []
 
     def clickrefresh():
         buttonstateswhilerunning.append(gui.refreshgraphbutton.instate(["!disabled"]))
         recreatecountbeforeclick.append(gui.fermenter.graphrecreatecount)
         gui.refreshgraph()
-        recreatecountafterclick.append(gui.fermenter.graphrecreatecount)
+        # The click must NOT recreate the graph synchronously (that nested,
+        # nested-in-a-Tk-callback path is what showed a real hang) - it only
+        # sets a flag serviced later from animate()'s safe top-level context.
+        requestflagimmediatelyafterclick.append(gui.fermenter.graphrefreshrequested)
+
+    def checkrecreated():
+        recreatecountsoonafterclick.append(gui.fermenter.graphrecreatecount)
 
     gui.root.after(1500, lambda: capturedprogress.append(gui.progressvar.get()))
     gui.root.after(1700, clickrefresh)
+    gui.root.after(2800, checkrecreated)  # a couple of animate() ticks later
     gui.root.after(3000, lambda: gui.stop(heateroff=True))
     gui.startprogram()
     stopflag.append(True)
@@ -193,7 +201,10 @@ def test_start_stop(gui):
 
     assert buttonstateswhilerunning == [True], "refresh graph button was not enabled while running"
     assert recreatecountbeforeclick == [0], "unexpected automatic graph recreation (should default to off)"
-    assert recreatecountafterclick == [1], "clicking 'Refresh graph' did not recreate the graph"
+    assert requestflagimmediatelyafterclick == [True], \
+        "clicking 'Refresh graph' must only set a request flag, not recreate synchronously"
+    assert recreatecountsoonafterclick == [1], \
+        "the requested graph refresh was never serviced by animate()"
     assert gui.refreshgraphbutton.instate(["disabled"]), "refresh graph button not disabled after stop"
 
     assert capturedprogress, "progress display was never captured while running"

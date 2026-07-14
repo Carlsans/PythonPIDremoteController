@@ -22,11 +22,38 @@ The control panel starts, configures and stops everything (run from the project 
   keeps holding the target. Use water, not milk.
 - **Start program / Stop**: "Stop (keep heating)" leaves the MCU holding its last
   setpoint (the MCU is autonomous); "Stop & heater off" sends SetSP(1) first.
-- **Refresh graph**: manually closes and reopens the graph window. Automatic
-  periodic refresh is off by default (see `YOGURT_GRAPH_REFRESH_SECONDS`
-  below) since it raises/refocuses the window, which is disruptive on its
-  own; use this button (or the diagnostics log) if the graph ever actually
-  looks frozen.
+- **Refresh graph**: requests the graph window be closed and reopened; the
+  actual work happens on the next tick from a safe context, not synchronously
+  from the button click (see "Only one instance at a time" below for why).
+  Automatic periodic refresh is off by default (see
+  `YOGURT_GRAPH_REFRESH_SECONDS` below) since it raises/refocuses the window,
+  which is disruptive on its own.
+
+## Only one instance at a time
+
+Starting a second `yogurtdata.py`/GUI process against the same ESP (port) is
+now refused with a clear error instead of silently succeeding. This was added
+after a real overnight run showed two independent processes running for
+*hours* against the same ESP: both had bound the same UDP port (Python's
+`SO_REUSEADDR` allows that), so the kernel silently delivered each incoming
+packet to only one of them at a time - one process kept controlling the pot
+normally while the other sat frozen on stale data, and both were sending
+their own `SetSP`/`SetTunings` commands to the real ESP the whole time. This
+went unnoticed because neither process actually crashed; a window that looks
+frozen (see "Diagnosing a frozen graph" below) is not the same as a dead
+process, and starting a fresh instance without confirming the old one is
+really gone leaves it running in the background indefinitely.
+
+If you ever see "Another instance is already running" and you're sure
+nothing legitimate is using it, find and close it first:
+
+    ps aux | grep -i yogurt
+
+Also: `applyProgram()`, `checkconnection()`, `relayautotune.update()`, and the
+GUI's `ontick()` are now wrapped so a bug in any of them can no longer take
+the whole run down silently (they used to run unprotected). If `ontick()`
+keeps failing (e.g. the GUI window is gone), the loop stops itself after 10
+consecutive failures rather than running invisibly forever.
 
 ## Modes
 
@@ -94,8 +121,8 @@ the real device:
     ./venvarch/bin/python tests/test_connection_robustness.py
     ./venvarch/bin/python tests/test_settings_and_program.py
     ./venvarch/bin/python tests/test_gui.py
-
     ./venvarch/bin/python tests/test_overshoot_fix.py
+    ./venvarch/bin/python tests/test_robustness_hardening.py
 
 `tests/test_graph_refresh.py` needs a real display (it drives the actual
 interactive graph window, not the headless Agg backend used by the tests

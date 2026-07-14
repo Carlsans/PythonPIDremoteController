@@ -1,7 +1,10 @@
 import datetime
+import errno
+import fcntl
 import math
 import os
 import socket
+import tempfile
 import time
 
 import numpy as np
@@ -13,6 +16,47 @@ import matplotlib.dates as md
 from src.PIDProgram import PIDProgram
 from src.RelayAutotune import RelayAutotune
 from src.NetworkConfiguration import NetworkConfiguration
+
+
+class SingleInstanceError(Exception):
+    pass
+
+
+def acquireportlock(port):
+    """Exclusive, OS-level lock keyed by the listen port.
+
+    Two YogourtFermenter processes bound to the same UDP port (e.g. a
+    leftover process from a previous run that looked frozen, plus a freshly
+    started one) do NOT error - the kernel happily delivers each incoming
+    packet to whichever socket it picks, so both processes silently run
+    "successfully" while randomly losing packets to each other and each
+    sending their own (possibly stale/conflicting) commands to the real ESP.
+    This was confirmed happening for hours at a stretch via
+    graph_diagnostics.log. Refusing to start a second instance for the same
+    port makes that impossible instead of relying on the user noticing.
+
+    flock() is tied to the file descriptor: even a killed (SIGKILL) process
+    releases it automatically when the OS closes its file descriptors, so
+    there is no stale-lock cleanup to worry about.
+    """
+    lockpath = os.path.join(tempfile.gettempdir(), "yogurtfermenter_port_" + str(port) + ".lock")
+    lockfile = open(lockpath, 'w')
+    try:
+        fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            lockfile.close()
+            raise SingleInstanceError(
+                "Another YogourtFermenter process is already using port " + str(port)
+                + ". Running two instances against the same ESP makes them silently race "
+                "for incoming packets and send it conflicting commands. Close the other "
+                "instance (check `ps aux | grep yogurt`) before starting a new one.")
+        raise
+    lockfile.write(str(os.getpid()) + "\n")
+    lockfile.flush()
+    return lockfile  # kept as self.portlock so the lock lives as long as the process does
+
+
 class YogourtFermenter():
     def __init__(self, mode=None, stages=None, tunings=None,
                  autotunetarget=None, onautotunedone=None,
@@ -26,6 +70,7 @@ class YogourtFermenter():
         # Called on every loop iteration (several times per second); the GUI
         # uses it to stay responsive while the loop runs.
         self.ontick = ontick
+        self.ontickfailures = 0
         self.stoprequested = False
         self.tempbysec = []
         self.CV = []
@@ -55,6 +100,10 @@ class YogourtFermenter():
         # graph" button (or call recreategraph() directly) if one ever is.
         self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 0))
         self.graphrecreatecount = 0
+        # Set by requestgraphrefresh() (the GUI's "Refresh graph" button) and
+        # serviced from animate(), never called directly from the button's
+        # callback - see requestgraphrefresh() for why.
+        self.graphrefreshrequested = False
         # Diagnostic log for the graph-freeze investigation: timing of every
         # redraw call plus periodic heartbeats, so a run that visually froze
         # can be correlated afterwards with what the process actually saw.
@@ -68,6 +117,7 @@ class YogourtFermenter():
         self.diagmaxredrawms = 0.0
         self.setPidvalues()
         self.networkconf = NetworkConfiguration()
+        self.portlock = acquireportlock(self.networkconf.listen_port)
         self.createsocket()
         self.creategraph()
         if self.mode == 'pidprogram':
@@ -84,6 +134,24 @@ class YogourtFermenter():
 
         if autorun:
             self.listeningloop()
+
+    def safecall(self, label, fn, *args):
+        """Call fn(*args), logging and swallowing any exception instead of
+        letting it kill the whole control loop (and with it the whole
+        fermentation run). Returns True on success, False if fn raised.
+
+        applyProgram(), checkconnection(), relayautotune.update() and
+        ontick() used to be called unprotected here - any bug in any of them
+        (a stage-list edge case, a Tk/matplotlib hiccup...) would silently
+        take down the entire process with no trace of why.
+        """
+        try:
+            fn(*args)
+            return True
+        except Exception as e:
+            print(label, "raised an exception (ignored):", repr(e))
+            self.diaglog(label.upper().replace(".", "_").replace(" ", "_") + "_EXCEPTION " + repr(e))
+            return False
 
     def diaglog(self, message):
         if not self.diaglogpath:
@@ -180,10 +248,12 @@ class YogourtFermenter():
         to a long-lived window without the process ever seeing an error (no
         crash, no exception - the control loop keeps running fine while the
         graph just silently stops updating on screen). There is no reliable
-        way to detect that from inside matplotlib, so instead the window is
-        proactively recreated every `graphrefreshseconds`; this bounds how
-        long the graph can stay frozen to that interval instead of the rest
-        of a multi-hour/multi-day fermentation run.
+        way to detect that from inside matplotlib, so instead the window can
+        be proactively recreated (see `graphrefreshseconds`), bounding how
+        long the graph can stay frozen instead of the rest of a
+        multi-hour/multi-day fermentation run.
+
+        Only ever called from animate() (see requestgraphrefresh() for why).
         """
         self.diaglog("RECREATE_SCHEDULED age_s=" + str(round(time.time() - self.lastgraphrecreate, 1)))
         try:
@@ -193,10 +263,32 @@ class YogourtFermenter():
         self.graphrecreatecount += 1
         self.creategraph()
 
+    def requestgraphrefresh(self):
+        """Ask for the graph window to be closed and reopened (e.g. from the
+        GUI's "Refresh graph" button).
+
+        This does NOT call recreategraph() directly. The button's click
+        handler runs nested deep inside the GUI's own Tk event dispatch
+        (listeningloop() -> ontick() -> root.update() -> [button callback]),
+        several stack frames removed from listeningloop()'s own top level -
+        unlike the automatic refresh, which animate() only ever triggers
+        from that top level. A real run showed a process go silent (no
+        crash, just stopped producing any further output at all) within
+        seconds of a manual refresh click, while an isolated repro of the
+        same click could not reproduce a hang - consistent with a rare,
+        context-dependent GUI/Tk reentrancy issue rather than something in
+        recreategraph() itself. Setting a flag serviced from animate() makes
+        the manual and automatic paths run through the exact same, simpler
+        call context either way.
+        """
+        self.graphrefreshrequested = True
+
     def animate(self):
 
-        if self.graphrefreshseconds > 0 and hasattr(self, 'lastgraphrecreate') \
-                and time.time() - self.lastgraphrecreate > self.graphrefreshseconds:
+        if self.graphrefreshrequested or (
+                self.graphrefreshseconds > 0 and hasattr(self, 'lastgraphrecreate')
+                and time.time() - self.lastgraphrecreate > self.graphrefreshseconds):
+            self.graphrefreshrequested = False
             self.recreategraph()
 
         if not plt.get_fignums():
@@ -445,17 +537,24 @@ class YogourtFermenter():
                 self.PIDTermslist.append(self.currentPIDTerms)
                 self.cleanPlotlists()
                 self.animate()
-                self.checkconnection()
+                self.safecall("checkconnection", self.checkconnection)
                 if self.mode == 'relayautotune':
-                    self.relayautotune.update(self.currenttemp)
+                    self.safecall("relayautotune.update", self.relayautotune.update, self.currenttemp)
                 count += 1
                 if count > 5:
                     count = 0
                     self.savetempbysectocsv()
             if self.mode == 'pidprogram':
-                self.pidprogram.applyProgram()
+                self.safecall("pidprogram.applyProgram", self.pidprogram.applyProgram)
             if self.ontick is not None:
-                self.ontick()
+                if self.safecall("ontick", self.ontick):
+                    self.ontickfailures = 0
+                else:
+                    self.ontickfailures += 1
+                    if self.ontickfailures >= 10:
+                        print("ontick() failed 10 times in a row - assuming the GUI is gone, stopping.")
+                        self.diaglog("ONTICK_GIVING_UP after 10 consecutive failures")
+                        self.stoprequested = True
 
             try:
                 data, address = self.sock.recvfrom(4096)
@@ -483,6 +582,11 @@ class YogourtFermenter():
         # new run can bind it.
         try:
             self.sock.close()
+        except OSError:
+            pass
+        try:
+            fcntl.flock(self.portlock, fcntl.LOCK_UN)
+            self.portlock.close()
         except OSError:
             pass
         print("Listening loop stopped.")

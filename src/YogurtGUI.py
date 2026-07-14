@@ -41,6 +41,7 @@ class YogurtGUI:
         self.fermenter = None
         self.running = False
         self.closing = False
+        self._inplacepending = None
 
         self.root = tk.Tk()
         self.root.title("Yogurt Fermenter")
@@ -262,6 +263,9 @@ class YogurtGUI:
         self.autotunelabelentry.grid(row=0, column=3, padx=4)
         self.autotunebutton = ttk.Button(frame, text="Start autotune", command=self.startautotune)
         self.autotunebutton.grid(row=0, column=4, padx=4)
+        self.autotuneherebutton = ttk.Button(frame, text="Autotune here (resume after)",
+                                             state="disabled", command=self.autotuneinplace)
+        self.autotuneherebutton.grid(row=1, column=0, columnspan=5, pady=(4, 0))
 
     def startautotune(self):
         if self.running:
@@ -280,6 +284,74 @@ class YogurtGUI:
         self.runfermenter("Autotuning at " + str(target) + " C (profile '" + label + "')...",
                           mode='relayautotune', autotunetarget=target,
                           onautotunedone=lambda result: self.saveautotuneresult(label, result))
+
+    def autotuneinplace(self):
+        """Retune without formally stopping the ferment: stop the current
+        program run (heater keeps its last setpoint the whole time, same as
+        "Stop (keep heating)"), run the relay autotune at whatever the
+        program was actually holding right now, then automatically resume
+        the program from its current stage onward using the new tunings.
+
+        Only meaningful while a staged program is running - autotuning
+        itself has no "current stage" to resume into.
+        """
+        if not self.running or self.fermenter is None or self.fermenter.mode != 'pidprogram':
+            messagebox.showinfo("Autotune here",
+                                "Start the program first - this retunes at whatever it's "
+                                "currently holding, then resumes it automatically.")
+            return
+        # SP (what we've commanded), not currentSP (what the ESP has echoed
+        # back so far) - SP updates immediately when the program sets a
+        # stage target, currentSP only once a round-trip confirms it, which
+        # would make this depend on ESP echo timing for no good reason.
+        target = self.fermenter.SP
+        stageindex = self.fermenter.pidprogram.currentstage
+        resumestages = list(self.settings["stages"][stageindex:]) or list(self.settings["stages"][-1:])
+        label = self.autotunelabelentry.get().strip() or ("inplace-" + str(target) + "C")
+
+        self.setstatus("Stopping the program to autotune in place at " + str(target) + " C...")
+        self.autotuneherebutton["state"] = "disabled"
+        self.stop(heateroff=False)
+        self._inplacepending = (target, resumestages, label)
+        self.root.after(300, self._inplacewaitthenautotune)
+
+    def _inplacewaitthenautotune(self):
+        if self.running:
+            # The previous run hasn't finished unwinding yet - starting a new
+            # one now would race with it (see requestgraphrefresh()'s
+            # docstring for why nested/racing calls here are dangerous).
+            self.root.after(200, self._inplacewaitthenautotune)
+            return
+        target, resumestages, label = self._inplacepending
+        self._inplacepending = (resumestages, label)
+        self.runfermenter("In-place autotune at " + str(target) + " C (profile '" + label + "')...",
+                          mode='relayautotune', autotunetarget=target,
+                          onautotunedone=self._inplaceautotunedone)
+
+    def _inplaceautotunedone(self, result):
+        resumestages, label = self._inplacepending
+        self.saveautotuneresult(label, result)
+        if result is None:
+            self.setstatus("In-place autotune aborted - program NOT auto-resumed. "
+                           "Check the tunings, then press Start program yourself.")
+            return
+        self.setstatus("In-place autotune done - resuming the program with the new tunings...")
+        # The autotune keeps holding its target indefinitely once done; stop
+        # it the same way, then wait for it to unwind before resuming.
+        self.stop(heateroff=False)
+        self.root.after(300, self._inplacewaitthenresume)
+
+    def _inplacewaitthenresume(self):
+        if self.running:
+            self.root.after(200, self._inplacewaitthenresume)
+            return
+        resumestages, label = self._inplacepending
+        tunings = tuple(self.settings["pid_profiles"][label][k] for k in ("Kp", "Ki", "Kd"))
+        self.settings["stages"] = resumestages
+        self.store.save(self.settings)
+        self.refreshstages()
+        self.runfermenter("Program resumed with in-place tunings (profile '" + label + "')...",
+                          mode='pidprogram', stages=resumestages, tunings=tunings)
 
     # ------------------------------------------------------------------
     # Run / stop
@@ -335,6 +407,8 @@ class YogurtGUI:
         self.stopbutton["state"] = "normal"
         self.stopoffbutton["state"] = "normal"
         self.refreshgraphbutton["state"] = "normal"
+        # Only meaningful while a staged program (not an autotune) is active.
+        self.autotuneherebutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
         self.setstatus(statustext)
         try:
             self.fermenter = YogourtFermenter(ontick=self.ontick, autorun=False, **kwargs)
@@ -352,6 +426,7 @@ class YogurtGUI:
                 self.stopbutton["state"] = "disabled"
                 self.stopoffbutton["state"] = "disabled"
                 self.refreshgraphbutton["state"] = "disabled"
+                self.autotuneherebutton["state"] = "disabled"
                 self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
                 self.progressvar.set("Idle - nothing running")
         if self.closing:

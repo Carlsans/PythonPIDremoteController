@@ -589,6 +589,18 @@ class YogourtFermenter():
             self.portlock.close()
         except OSError:
             pass
+        try:
+            # Without this, a second YogourtFermenter instance created later
+            # in the same process (e.g. the GUI's "Autotune here" flow: stop
+            # -> autotune -> stop -> resume, three instances in a row) finds
+            # plt.get_fignums() still non-empty, so creategraph() silently
+            # no-ops and self.ax1 etc. never get set on the new instance -
+            # every subsequent animate() call then raises AttributeError
+            # (caught, so it doesn't crash the run, but the graph never
+            # reappears for the rest of that instance's life).
+            plt.close(self.fig)
+        except Exception:
+            pass
         print("Listening loop stopped.")
 
 

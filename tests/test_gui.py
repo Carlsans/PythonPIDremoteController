@@ -217,6 +217,143 @@ def test_start_stop(gui):
     print("OK - start program / stop & heater off cycle, progress display")
 
 
+def test_autotune_in_place(gui):
+    """Full cycle: Start a 38 C hold with deliberately-too-aggressive tunings
+    -> click 'Autotune here (resume after)' once it's holding -> the program
+    auto-stops, autotunes at 38 C, saves a new profile, and auto-resumes the
+    SAME stage with the new tunings - all over real (simulated, fast) UDP.
+    """
+    from tests.simulator import SimulatedPot
+
+    port_esp, port_listen = 55033, 55032
+    os.environ["YOGURT_ESP_PORT"] = str(port_esp)
+    os.environ["YOGURT_LISTEN_PORT"] = str(port_listen)
+
+    gui.settings["stages"] = [{"temperature": 38.0, "duration_minutes": 9999.0}]
+    gui.refreshstages()
+    badtunings = {"Kp": 60.0, "Ki": 0.05, "Kd": 0.0}  # deliberately too aggressive for this "pot"
+    gui.settings["pid_profiles"]["inplace-start"] = dict(badtunings)
+    gui.settings["active_profile"] = "inplace-start"
+    gui.store.save(gui.settings)
+    gui.refreshprofiles()
+
+    esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    esp.bind(("127.0.0.1", port_esp))
+    esp.settimeout(0.1)
+    stopflag = []
+    lastsp = [1.0]
+
+    def fakeesp():
+        # Fast thermal model (compressed time constant) so a full 6-cycle
+        # relay autotune completes in seconds of real/wall-clock time
+        # instead of the ~15 min/cycle a real pot takes.
+        pot = SimulatedPot(ambient=30.0, fullpowerrise=20.0, tau=3.0, deadtime=1.0)
+        while not stopflag:
+            try:
+                while True:
+                    data, _ = esp.recvfrom(4096)
+                    msg = data.decode()
+                    if msg.startswith("SetSP("):
+                        lastsp[0] = float(msg[6:-1])
+            except socket.timeout:
+                pass
+            sp = lastsp[0]
+            if sp > pot.temp + 0.3:
+                output = 255.0
+            elif sp < pot.temp - 0.3:
+                output = 0.0
+            else:
+                output = 55.0  # modest holding power near equilibrium
+            pot.step(output)
+            esp.sendto(("Sensor temp: " + str(round(pot.temp, 2))).encode(), ("127.0.0.1", port_listen))
+            esp.sendto(("Output:" + str(output)).encode(), ("127.0.0.1", port_listen))
+            esp.sendto(b"PID Terms: 1.0,0.1,0.0", ("127.0.0.1", port_listen))
+            esp.sendto(("SetPoint: " + str(sp)).encode(), ("127.0.0.1", port_listen))
+            time.sleep(0.1)
+
+    espthread = threading.Thread(target=fakeesp, daemon=True)
+    espthread.start()
+
+    events = {"clicked": False, "resumed": False, "timeout": False}
+
+    def waitthenclick():
+        if gui.fermenter is None or gui.fermenter.currenttemp < 37.5:
+            gui.root.after(300, waitthenclick)
+            return
+        events["clicked"] = True
+        assert gui.autotuneherebutton.instate(["!disabled"]), \
+            "'Autotune here' should be enabled once the program is holding"
+        gui.autotuneinplace()
+
+    def resumed():
+        return (gui.running and gui.fermenter is not None and gui.fermenter.mode == 'pidprogram'
+               and "inplace-38.0C" in gui.settings["pid_profiles"])
+
+    # gui.startprogram() only blocks for as long as ITS OWN fermenter run is
+    # active; clicking "Autotune here" stops that run, so this first call
+    # returns as soon as the click fires (well before the autotune has even
+    # started). The two follow-up runs it schedules (autotune, then resume)
+    # are only driven by whatever keeps pumping the Tk event loop afterwards
+    # - in the real app that's root.mainloop(), which runs for the life of
+    # the window regardless of any single button handler returning. This
+    # test has no mainloop(), so it must keep pumping root.update() itself
+    # for exactly the same reason.
+    #
+    # But once a later run (e.g. the resumed pidprogram) is active, it is
+    # ITSELF blocking inside one of those root.update() calls - control does
+    # not return to this function's own while loop until that nested call
+    # unwinds. So "detect resumed() and stop it" cannot be done from out
+    # here; it has to happen from inside, via the SAME ontick() hook the
+    # fermenter already calls on every iteration regardless of nesting depth.
+    originalontick = gui.ontick
+
+    def testontick():
+        originalontick()
+        if not events["resumed"] and resumed():
+            events["resumed"] = True
+            gui.fermenter.stoprequested = True
+
+    gui.ontick = testontick
+    try:
+        gui.root.after(500, waitthenclick)
+        gui.startprogram()
+
+        deadline = time.time() + 90
+        while time.time() < deadline and not events["resumed"]:
+            gui.root.update()
+            time.sleep(0.05)
+        events["timeout"] = not events["resumed"]
+    finally:
+        gui.ontick = originalontick
+
+    if not events["resumed"] and gui.fermenter is not None:
+        gui.fermenter.stoprequested = True
+    stopdeadline = time.time() + 10
+    while gui.running and time.time() < stopdeadline:
+        gui.root.update()
+        time.sleep(0.05)
+
+    stopflag.append(True)
+    espthread.join(timeout=5)
+    esp.close()
+
+    assert events["clicked"], "never reached the holding temperature to click 'Autotune here'"
+    assert not events["timeout"], "in-place autotune + resume did not complete within 90s"
+    assert events["resumed"], "program never auto-resumed after the in-place autotune"
+    assert not gui.running and gui.fermenter is None
+
+    stored = storedsettings()
+    assert "inplace-38.0C" in stored["pid_profiles"]
+    newtunings = stored["pid_profiles"]["inplace-38.0C"]
+    assert newtunings != badtunings, "autotune did not actually change the tunings"
+    assert stored["active_profile"] == "inplace-38.0C"
+    assert stored["stages"] == [{"temperature": 38.0, "duration_minutes": 9999.0}], \
+        "resumed stage list should match what was running before autotune"
+    assert gui.autotuneherebutton.instate(["disabled"]), \
+        "'Autotune here' should be disabled again once stopped"
+    print("OK - Autotune here (resume after) full cycle:", newtunings)
+
+
 def main():
     gui = YogurtGUI()
     gui.root.update()
@@ -225,6 +362,7 @@ def main():
         test_stageprograms(gui)
         test_profiles(gui)
         test_start_stop(gui)
+        test_autotune_in_place(gui)
     finally:
         gui.root.destroy()
     print("\nOK - all GUI tests passed.")

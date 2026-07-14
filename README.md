@@ -20,6 +20,19 @@ The control panel starts, configures and stops everything (run from the project 
 - **Autotune**: enter a target temperature and a profile name, press Start
   autotune. When it finishes, the tunings are saved under that name and the pot
   keeps holding the target. Use water, not milk.
+- **Autotune here (resume after)**: retune without stopping the ferment for
+  good - available while the staged program is running. It stops the current
+  run (the MCU keeps its last setpoint the whole time, same as "Stop (keep
+  heating)"), runs the relay autotune at whatever temperature the program was
+  actually holding, saves the result as a profile named `inplace-<temp>C`,
+  and automatically resumes the program from its current stage onward using
+  the new tunings. Note the relay method still needs to swing the output
+  fully on/off to measure anything (the firmware has no direct duty-cycle
+  control, only setpoint/tunings/an on-off override), so the temperature will
+  oscillate by a few degrees for the ~10-30 min the autotune takes - this is
+  for fixing tunings that are visibly wrong (e.g. persistent oscillation from
+  a profile tuned at a very different temperature or in a different medium),
+  not something to run routinely.
 - **Start program / Stop**: "Stop (keep heating)" leaves the MCU holding its last
   setpoint (the MCU is autonomous); "Stop & heater off" sends SetSP(1) first.
 - **Refresh graph**: requests the graph window be closed and reopened; the

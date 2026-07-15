@@ -275,6 +275,33 @@ def test_stop_freezes_tunings():
     print("OK - stop() freezes tunings and stops updating")
 
 
+def test_zero_starting_parameter_can_move():
+    """Regression test: found on a real run (Kd starts at 0.0, the project's
+    deliberate default given the sensor's quantization noise) - the
+    exploratory step used to be a pure relative step (value * (1+frac)),
+    which computes 0 * anything = 0 forever, permanently stuck. Deterministic
+    unit test (not a thermal simulation) so it does not depend on whether a
+    simulated pot happens to reproduce the exact real conditions."""
+    simtime, pot, pid, controller, optimizer = makerig(
+        {"Kp": 19.76, "Ki": 0.03, "Kd": 0.0}, maxswing=MAXSWING,
+        windowseconds=10, settleseconds=2)
+    # Skip straight to tuning Kd, matching what the real run actually saw.
+    optimizer.paramindex = optimizer.paramorder.index('Kd')
+
+    for i in range(30):
+        simtime["t"] = float(i)
+        optimizer.update(SETPOINT + 0.1, setpoint=SETPOINT, now=simtime["t"])
+    assert optimizer.state == 'running'
+
+    for i in range(30, 41):
+        simtime["t"] = float(i)
+        optimizer.update(SETPOINT + 0.1, setpoint=SETPOINT, now=simtime["t"])
+    assert optimizer.currenttunings['Kd'] != 0.0, \
+        "Kd must move away from 0.0 after its first window, got " + str(optimizer.currenttunings)
+    print("OK - a parameter starting at exactly 0.0 (Kd) can actually be explored:",
+          optimizer.currenttunings['Kd'])
+
+
 if __name__ == '__main__':
     test_never_exceeds_safety_limit_with_bad_starting_tunings()
     test_tripsafety_mechanism_directly()
@@ -282,4 +309,5 @@ if __name__ == '__main__':
     test_trips_and_recovers_from_a_mid_hold_disturbance()
     test_iae_improves_over_time()
     test_stop_freezes_tunings()
+    test_zero_starting_parameter_can_move()
     print("\nOK - all PIDOptimizer tests passed.")

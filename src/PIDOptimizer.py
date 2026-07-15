@@ -36,12 +36,24 @@ class PIDOptimizer:
     and the tests in tests/test_pidoptimizer.py that exercise this).
     """
 
+    # Fallback absolute step used when a relative step (value * stepfraction)
+    # would be zero or negligible - most notably when a parameter starts at
+    # exactly 0.0 (e.g. Kd, which defaults to 0 because of the MAX6675's
+    # quantization - see PIDProgram.py). Without this, "value * (1 +
+    # stepfraction)" computes 0 * anything = 0 forever, and that parameter
+    # can never actually be explored. Found on a real run: Kd stayed
+    # permanently stuck at 0.0 across repeated windows.
+    DEFAULT_MINSTEPS = {'Kp': 0.5, 'Ki': 0.002, 'Kd': 0.1}
+
     def __init__(self, controller, starttunings, maxswing=3.0, safetymargin=0.6,
                  windowseconds=15 * 60, stepfraction=0.15,
-                 windowsperparam=3, settleseconds=5 * 60, timesource=time.time,
-                 onstatechange=None):
+                 windowsperparam=3, settleseconds=5 * 60, minsteps=None,
+                 timesource=time.time, onstatechange=None):
         self.controller = controller
         self.maxswing = maxswing
+        self.minsteps = dict(self.DEFAULT_MINSTEPS)
+        if minsteps:
+            self.minsteps.update(minsteps)
         self.tripthreshold = maxswing * safetymargin
         self.windowseconds = windowseconds
         self.stepfraction = stepfraction
@@ -244,18 +256,22 @@ class PIDOptimizer:
         self.evercompletedwindow = True
         self.safetunings = dict(self.currenttunings)
 
+        minstep = self.minsteps.get(param, 0.01)
         if self.lastparamvalue is None:
             # First measurement for this parameter: take an initial step,
             # remember this point as the baseline for the next comparison.
             self.lastparamvalue = value
             self.lastiae = iae
-            newvalue = value * (1.0 + self.stepfraction)
+            step = value * self.stepfraction
+            if abs(step) < minstep:
+                step = minstep
+            newvalue = value + step
         else:
             deltaparam = value - self.lastparamvalue
             deltaiae = iae - self.lastiae
             slope = 0.0 if abs(deltaparam) < 1e-12 else deltaiae / deltaparam
             direction = -1.0 if slope > 0 else 1.0
-            stepsize = max(abs(value) * self.stepfraction * 0.5, 1e-9)
+            stepsize = max(abs(value) * self.stepfraction * 0.5, minstep * 0.5)
             newvalue = max(value + direction * stepsize, 0.0)
             self.lastparamvalue = value
             self.lastiae = iae

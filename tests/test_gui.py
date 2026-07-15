@@ -354,6 +354,125 @@ def test_autotune_in_place(gui):
     print("OK - Autotune here (resume after) full cycle:", newtunings)
 
 
+def test_pid_optimizer_toggle(gui):
+    """Start program at 38 C -> once holding, click 'Start optimizer' -> it
+    settles, runs windows, and nudges tunings -> click 'Stop optimizer' ->
+    tunings freeze and gui.fermenter.pidoptimizer is cleared."""
+    from tests.simulator import SimulatedPot, SimulatedAdaptiveMCUPID
+
+    # Short window/settle so this completes in seconds of real time instead
+    # of the real GUI's default 15 min windows / 5 min settle.
+    os.environ["YOGURT_OPTIMIZER_WINDOW_SECONDS"] = "6"
+    os.environ["YOGURT_OPTIMIZER_SETTLE_SECONDS"] = "2"
+
+    port_esp, port_listen = 55035, 55034
+    os.environ["YOGURT_ESP_PORT"] = str(port_esp)
+    os.environ["YOGURT_LISTEN_PORT"] = str(port_listen)
+
+    gui.settings["stages"] = [{"temperature": 38.0, "duration_minutes": 9999.0}]
+    gui.refreshstages()
+    starttunings = {"Kp": 14.0, "Ki": 0.02, "Kd": 0.0}
+    gui.settings["pid_profiles"]["optimizer-start"] = dict(starttunings)
+    gui.settings["active_profile"] = "optimizer-start"
+    gui.store.save(gui.settings)
+    gui.refreshprofiles()
+
+    esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    esp.bind(("127.0.0.1", port_esp))
+    esp.settimeout(0.1)
+    stopflag = []
+
+    def fakeesp():
+        # A REAL closed-loop simulated MCU (not a crude neutral-band hack):
+        # it actually applies whatever cons/agg tunings are sent, exactly
+        # like SimulatedAdaptiveMCUPID does for tests/test_pidoptimizer.py,
+        # so this test can observe the optimizer's tuning changes actually
+        # affecting tracking quality, and so it settles into a genuinely
+        # stable hold (a fixed-output "neutral band" hack instead caused a
+        # persistent oscillation that fought the fermenter's own approach
+        # ramp and never let the optimizer settle).
+        # Start already close to target (PIDProgram's approach ramp runs on
+        # REAL wall-clock time at a fixed 0.5 C/min regardless of how fast
+        # this simulated pot itself responds, so a cold start from far away
+        # would make this test take many real minutes - starting within 0.25
+        # C of target makes updateapproachramp() skip the ramp entirely).
+        pot = SimulatedPot(ambient=37.85, fullpowerrise=20.0, tau=3.0, deadtime=1.0)
+        pid = SimulatedAdaptiveMCUPID(outmax=255.0)
+        pid.settuningsagg(100.0, 0.0, 0.0)
+        pid.settuningscons(14.0, 0.02, 0.0)
+        pid.setpoint = 1.0
+        while not stopflag:
+            try:
+                while True:
+                    data, _ = esp.recvfrom(4096)
+                    msg = data.decode()
+                    if msg.startswith("SetSP("):
+                        pid.setpoint = float(msg[6:-1])
+                    elif msg.startswith("SetTuningscons("):
+                        kp, ki, kd = (float(v) for v in msg[len("SetTuningscons("):-1].split(","))
+                        pid.settuningscons(kp, ki, kd)
+                    elif msg.startswith("SetTuningsagg("):
+                        kp, ki, kd = (float(v) for v in msg[len("SetTuningsagg("):-1].split(","))
+                        pid.settuningsagg(kp, ki, kd)
+            except socket.timeout:
+                pass
+            measured = round(pot.temp * 4) / 4.0
+            output = pid.compute(measured)
+            pot.step(output)
+            esp.sendto(("Sensor temp: " + str(round(pot.temp, 2))).encode(), ("127.0.0.1", port_listen))
+            esp.sendto(("Output:" + str(output)).encode(), ("127.0.0.1", port_listen))
+            esp.sendto(b"PID Terms: 1.0,0.1,0.0", ("127.0.0.1", port_listen))
+            esp.sendto(("SetPoint: " + str(pid.setpoint)).encode(), ("127.0.0.1", port_listen))
+            time.sleep(0.1)
+
+    espthread = threading.Thread(target=fakeesp, daemon=True)
+    espthread.start()
+
+    events = {"started": False, "windowscompleted": False, "stopped": False}
+
+    def waitthenstart():
+        if gui.fermenter is None or gui.fermenter.currenttemp < 37.5:
+            gui.root.after(300, waitthenstart)
+            return
+        assert gui.optimizerbutton.instate(["!disabled"]), \
+            "optimizer button should be enabled once the program is holding"
+        gui.toggleoptimizer()
+        events["started"] = gui.fermenter.pidoptimizer is not None
+        gui.root.after(300, waitforwindows)
+
+    def waitforwindows(deadline=None):
+        if deadline is None:
+            deadline = time.time() + 60
+        fermenter = gui.fermenter
+        if fermenter is None or fermenter.pidoptimizer is None:
+            return
+        if fermenter.pidoptimizer.getprogress()["windows_done"] >= 2:
+            events["windowscompleted"] = True
+            events["tunings"] = dict(fermenter.pidoptimizer.currenttunings)
+            gui.toggleoptimizer()
+            events["stopped"] = fermenter.pidoptimizer is None
+            gui.root.after(300, lambda: gui.stop(heateroff=True))
+            return
+        if time.time() > deadline:
+            gui.root.after(300, lambda: gui.stop(heateroff=True))
+            return
+        gui.root.after(200, lambda: waitforwindows(deadline))
+
+    gui.root.after(500, waitthenstart)
+    gui.startprogram()
+    stopflag.append(True)
+    espthread.join(timeout=5)
+    esp.close()
+
+    assert events["started"], "clicking 'Start optimizer' did not attach a PIDOptimizer"
+    assert events["windowscompleted"], "optimizer never completed 2 windows within 60s"
+    assert events["stopped"], "clicking 'Stop optimizer' did not detach the PIDOptimizer"
+    assert events["tunings"] != starttunings, "tunings never changed across 2 windows"
+    assert gui.optimizerbutton.instate(["disabled"]), \
+        "optimizer button should be disabled again once the program stopped"
+    print("OK - PID optimizer start/stop toggle, tunings changed:", events["tunings"])
+
+
 def main():
     gui = YogurtGUI()
     gui.root.update()
@@ -363,6 +482,7 @@ def main():
         test_profiles(gui)
         test_start_stop(gui)
         test_autotune_in_place(gui)
+        test_pid_optimizer_toggle(gui)
     finally:
         gui.root.destroy()
     print("\nOK - all GUI tests passed.")

@@ -119,6 +119,10 @@ class YogourtFermenter():
         self.diaglastheartbeat = 0.0
         self.diagredrawcount = 0
         self.diagmaxredrawms = 0.0
+        # Optional online PID optimizer (see src/PIDOptimizer.py), set by the
+        # GUI's "Start optimizer" button. Runs alongside pidprogram mode,
+        # never replaces it - it only nudges the cons Kp/Ki/Kd over time.
+        self.pidoptimizer = None
         self.setPidvalues()
         self.networkconf = NetworkConfiguration()
         self.portlock = acquireportlock(self.networkconf.listen_port)
@@ -555,6 +559,8 @@ class YogourtFermenter():
                 self.safecall("checkconnection", self.checkconnection)
                 if self.mode == 'relayautotune':
                     self.safecall("relayautotune.update", self.relayautotune.update, self.currenttemp)
+                if self.pidoptimizer is not None:
+                    self.safecall("pidoptimizer.update", self.pidoptimizer.update, self.currenttemp)
                 count += 1
                 if count > 5:
                     count = 0

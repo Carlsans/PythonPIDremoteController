@@ -24,6 +24,7 @@ QApplication.processEvents(). This keeps everything single-threaded.
 """
 
 import copy
+import os
 import sys
 import time
 
@@ -32,6 +33,7 @@ import pyqtgraph as pg
 
 from src.SettingsStore import SettingsStore
 from src.yogurtdata import YogourtFermenter, SingleInstanceError
+from src.PIDOptimizer import PIDOptimizer
 
 
 def formatduration(seconds):
@@ -55,6 +57,7 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         self._inplacepending = None
         self.lastplotupdate = 0.0
         self.lastprogressupdate = 0.0
+        self.lastoptimizerupdate = 0.0
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -66,6 +69,7 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         controls.addWidget(self.buildstagesection())
         controls.addWidget(self.buildpidsection())
         controls.addWidget(self.buildautotunesection())
+        controls.addWidget(self.buildoptimizersection())
         controls.addWidget(self.buildrunsection())
         controls.addWidget(self.buildprogresssection())
         controls.addStretch(1)
@@ -416,6 +420,86 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
                           mode='pidprogram', stages=resumestages, tunings=tunings)
 
     # ------------------------------------------------------------------
+    # Online PID optimizer
+    # ------------------------------------------------------------------
+    def buildoptimizersection(self):
+        box = QtWidgets.QGroupBox("PID optimizer (online, gentle - IAE gradient descent)")
+        layout = QtWidgets.QVBoxLayout(box)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Max swing (C):"))
+        self.optimizermaxswingentry = QtWidgets.QLineEdit("3.0")
+        self.optimizermaxswingentry.setMaximumWidth(50)
+        row.addWidget(self.optimizermaxswingentry)
+        self.optimizerbutton = QtWidgets.QPushButton("Start optimizer")
+        self.optimizerbutton.setEnabled(False)
+        self.optimizerbutton.clicked.connect(self.toggleoptimizer)
+        row.addWidget(self.optimizerbutton)
+        layout.addLayout(row)
+        self.optimizerstatuslabel = QtWidgets.QLabel("Not running")
+        self.optimizerstatuslabel.setWordWrap(True)
+        layout.addWidget(self.optimizerstatuslabel)
+        return box
+
+    def toggleoptimizer(self):
+        if self.fermenter is None or self.fermenter.mode != 'pidprogram':
+            return
+        if self.fermenter.pidoptimizer is not None:
+            self.fermenter.pidoptimizer.stop()
+            self.fermenter.pidoptimizer = None
+            self.optimizerbutton.setText("Start optimizer")
+            self.optimizerstatuslabel.setText("Stopped")
+            return
+        try:
+            maxswing = float(self.optimizermaxswingentry.text())
+        except ValueError:
+            QtWidgets.QMessageBox.critical(self, "PID optimizer", "Max swing must be a number.")
+            return
+        try:
+            starttunings = {"Kp": float(self.pidentries["Kp"].text()),
+                            "Ki": float(self.pidentries["Ki"].text()),
+                            "Kd": float(self.pidentries["Kd"].text())}
+        except ValueError:
+            QtWidgets.QMessageBox.critical(self, "PID optimizer", "Kp, Ki and Kd must be numbers.")
+            return
+        self.fermenter.pidoptimizer = PIDOptimizer(
+            self.fermenter, starttunings, maxswing=maxswing,
+            windowseconds=float(os.environ.get('YOGURT_OPTIMIZER_WINDOW_SECONDS', 15 * 60)),
+            settleseconds=float(os.environ.get('YOGURT_OPTIMIZER_SETTLE_SECONDS', 5 * 60)),
+            onstatechange=lambda msg: self.setstatus("Optimizer: " + msg))
+        self.optimizerbutton.setText("Stop optimizer")
+        self.optimizerstatuslabel.setText("Running - waiting to settle near target")
+
+    def updateoptimizerstatus(self):
+        now = time.time()
+        if now - self.lastoptimizerupdate < 1.0:
+            return
+        self.lastoptimizerupdate = now
+        fermenter = self.fermenter
+        if fermenter is None or fermenter.pidoptimizer is None:
+            return
+        progress = fermenter.pidoptimizer.getprogress()
+        tunings = progress["tunings"]
+        text = ("State: " + progress["state"] + "  |  tuning " + progress["param"]
+               + "  |  Kp=" + str(round(tunings["Kp"], 5)) + " Ki=" + str(round(tunings["Ki"], 6))
+               + " Kd=" + str(round(tunings["Kd"], 5)))
+        if progress["state"] == 'running':
+            text += ("\nWindow: " + formatduration(progress["window_elapsed_s"]) + " / "
+                    + formatduration(progress["window_seconds"])
+                    + "  IAE so far=" + str(round(progress["current_iae"], 1))
+                    + "  max err so far=" + str(round(progress["current_maxerr"], 3)) + " C")
+        elif progress["state"] == 'cooldown':
+            text += "\nCooldown remaining: " + formatduration(progress["cooldown_remaining_s"])
+        elif progress["settling"]:
+            text += "\nSettling: " + formatduration(progress["settle_remaining_s"]) + " remaining"
+        text += "\nWindows completed: " + str(progress["windows_done"])
+        for key in ("Kp", "Ki", "Kd"):
+            entry = self.pidentries[key]
+            newvalue = str(tunings[key])
+            if entry.text() != newvalue:
+                entry.setText(newvalue)
+        self.optimizerstatuslabel.setText(text)
+
+    # ------------------------------------------------------------------
     # Run / stop
     # ------------------------------------------------------------------
     def buildrunsection(self):
@@ -465,6 +549,7 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         self.stopbutton.setEnabled(True)
         self.stopoffbutton.setEnabled(True)
         self.autotuneherebutton.setEnabled(kwargs.get('mode') == 'pidprogram')
+        self.optimizerbutton.setEnabled(kwargs.get('mode') == 'pidprogram')
         self.setstatus(statustext)
         try:
             self.fermenter = YogourtFermenter(ontick=self.ontick, autorun=False, showgraph=False, **kwargs)
@@ -482,6 +567,9 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
                 self.stopbutton.setEnabled(False)
                 self.stopoffbutton.setEnabled(False)
                 self.autotuneherebutton.setEnabled(False)
+                self.optimizerbutton.setEnabled(False)
+                self.optimizerbutton.setText("Start optimizer")
+                self.optimizerstatuslabel.setText("Not running")
                 self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
                 self.progresslabel.setText("Idle - nothing running")
         if self.closing:
@@ -603,6 +691,7 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
             return
         self.updateprogress()
         self.updateplots()
+        self.updateoptimizerstatus()
         QtWidgets.QApplication.instance().processEvents()
 
     def closeEvent(self, event):

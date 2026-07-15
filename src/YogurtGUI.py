@@ -258,14 +258,24 @@ class YogurtGUI:
         self.autotunetargetentry = ttk.Entry(frame, width=7)
         self.autotunetargetentry.insert(0, "40")
         self.autotunetargetentry.grid(row=0, column=1, padx=4)
-        ttk.Label(frame, text="Save as profile:").grid(row=0, column=2)
+        ttk.Label(frame, text="Margin (C):").grid(row=0, column=2)
+        self.autotunemarginentry = ttk.Entry(frame, width=5)
+        self.autotunemarginentry.insert(0, "12")
+        self.autotunemarginentry.grid(row=0, column=3, padx=4)
+        ttk.Label(frame, text="Save as profile:").grid(row=0, column=4)
         self.autotunelabelentry = ttk.Entry(frame, width=18)
-        self.autotunelabelentry.grid(row=0, column=3, padx=4)
+        self.autotunelabelentry.grid(row=0, column=5, padx=4)
         self.autotunebutton = ttk.Button(frame, text="Start autotune", command=self.startautotune)
-        self.autotunebutton.grid(row=0, column=4, padx=4)
+        self.autotunebutton.grid(row=0, column=6, padx=4)
         self.autotuneherebutton = ttk.Button(frame, text="Autotune here (resume after)",
                                              state="disabled", command=self.autotuneinplace)
-        self.autotuneherebutton.grid(row=1, column=0, columnspan=5, pady=(4, 0))
+        self.autotuneherebutton.grid(row=1, column=0, columnspan=7, pady=(4, 0))
+
+    def autotunemargin(self):
+        try:
+            return float(self.autotunemarginentry.get())
+        except ValueError:
+            return 12.0
 
     def startautotune(self):
         if self.running:
@@ -283,6 +293,7 @@ class YogurtGUI:
             label = "autotune-" + str(target) + "C"
         self.runfermenter("Autotuning at " + str(target) + " C (profile '" + label + "')...",
                           mode='relayautotune', autotunetarget=target,
+                          autotunesafetymargin=self.autotunemargin(),
                           onautotunedone=lambda result: self.saveautotuneresult(label, result))
 
     def autotuneinplace(self):
@@ -326,6 +337,7 @@ class YogurtGUI:
         self._inplacepending = (resumestages, label)
         self.runfermenter("In-place autotune at " + str(target) + " C (profile '" + label + "')...",
                           mode='relayautotune', autotunetarget=target,
+                          autotunesafetymargin=self.autotunemargin(),
                           onautotunedone=self._inplaceautotunedone)
 
     def _inplaceautotunedone(self, result):

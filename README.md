@@ -31,7 +31,10 @@ Run from the project root:
   applied when the program starts.
 - **Autotune**: enter a target temperature and a profile name, press Start
   autotune. When it finishes, the tunings are saved under that name and the pot
-  keeps holding the target. Use water, not milk.
+  keeps holding the target. Use water, not milk. "Margin (C)" bounds how far
+  above target the relay's "heater on" setpoint can swing (default 12 C);
+  tighten it (e.g. 5-7) when autotuning near a live, temperature-sensitive
+  culture rather than plain water.
 - **Autotune here (resume after)**: retune without stopping the ferment for
   good - available while the staged program is running. It stops the current
   run (the MCU keeps its last setpoint the whole time, same as "Stop (keep

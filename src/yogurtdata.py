@@ -59,8 +59,8 @@ def acquireportlock(port):
 
 class YogourtFermenter():
     def __init__(self, mode=None, stages=None, tunings=None,
-                 autotunetarget=None, onautotunedone=None,
-                 ontick=None, autorun=True):
+                 autotunetarget=None, autotunesafetymargin=12.0, onautotunedone=None,
+                 ontick=None, autorun=True, showgraph=True):
         modes = ['pidprogram','relayautotune']
         if mode is None:
             mode = os.environ.get('YOGURT_MODE', modes[0])
@@ -72,6 +72,10 @@ class YogourtFermenter():
         self.ontick = ontick
         self.ontickfailures = 0
         self.stoprequested = False
+        # When False, this instance never touches matplotlib at all - used
+        # by GUIs that own their own plotting (e.g. the PyQt/pyqtgraph
+        # control panel) and read tempbysec/CV/etc. themselves instead.
+        self.showgraph = showgraph
         self.tempbysec = []
         self.CV = []
         self.SPlist = []
@@ -127,7 +131,10 @@ class YogourtFermenter():
                 autotunetarget = float(os.environ.get('YOGURT_AUTOTUNE_TARGET', self.SP))
             # Bound the relay's "heater on" setpoint a bit above the target so
             # high targets like 82 C work but nothing can approach boiling.
-            maxsafe = min(95.0, autotunetarget + 12)
+            # A tighter margin caps how far the relay can swing above target,
+            # useful when autotuning near a live, temperature-sensitive
+            # culture rather than plain water.
+            maxsafe = min(95.0, autotunetarget + autotunesafetymargin)
             self.relayautotune = RelayAutotune(self, targettemp=autotunetarget,
                                                maxsafetemp=maxsafe,
                                                oncomplete=onautotunedone)
@@ -209,6 +216,8 @@ class YogourtFermenter():
 
 
     def creategraph(self):
+        if not self.showgraph:
+            return
         if plt.get_fignums():
             print("Graphic already opened")
             return
@@ -255,6 +264,8 @@ class YogourtFermenter():
 
         Only ever called from animate() (see requestgraphrefresh() for why).
         """
+        if not self.showgraph:
+            return
         self.diaglog("RECREATE_SCHEDULED age_s=" + str(round(time.time() - self.lastgraphrecreate, 1)))
         try:
             plt.close(self.fig)
@@ -281,9 +292,13 @@ class YogourtFermenter():
         the manual and automatic paths run through the exact same, simpler
         call context either way.
         """
+        if not self.showgraph:
+            return
         self.graphrefreshrequested = True
 
     def animate(self):
+        if not self.showgraph:
+            return
 
         if self.graphrefreshrequested or (
                 self.graphrefreshseconds > 0 and hasattr(self, 'lastgraphrecreate')
@@ -589,18 +604,19 @@ class YogourtFermenter():
             self.portlock.close()
         except OSError:
             pass
-        try:
-            # Without this, a second YogourtFermenter instance created later
-            # in the same process (e.g. the GUI's "Autotune here" flow: stop
-            # -> autotune -> stop -> resume, three instances in a row) finds
-            # plt.get_fignums() still non-empty, so creategraph() silently
-            # no-ops and self.ax1 etc. never get set on the new instance -
-            # every subsequent animate() call then raises AttributeError
-            # (caught, so it doesn't crash the run, but the graph never
-            # reappears for the rest of that instance's life).
-            plt.close(self.fig)
-        except Exception:
-            pass
+        if self.showgraph:
+            try:
+                # Without this, a second YogourtFermenter instance created
+                # later in the same process (e.g. the GUI's "Autotune here"
+                # flow: stop -> autotune -> stop -> resume, three instances
+                # in a row) finds plt.get_fignums() still non-empty, so
+                # creategraph() silently no-ops and self.ax1 etc. never get
+                # set on the new instance - every subsequent animate() call
+                # then raises AttributeError (caught, so it doesn't crash the
+                # run, but the graph never reappears for that instance).
+                plt.close(self.fig)
+            except Exception:
+                pass
         print("Listening loop stopped.")
 
 

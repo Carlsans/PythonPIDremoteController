@@ -6,9 +6,21 @@ Run yogurtdata.py
 
 ## GUI
 
-The control panel starts, configures and stops everything (run from the project root):
+Two control panels exist with the same feature set; pick one:
+
+- **Tkinter + matplotlib** (`src/YogurtGUI.py`) - the original, no extra
+  dependencies beyond what's already installed.
+- **PyQt5 + pyqtgraph** (`src/YogurtGUIQt.py`) - a faster-drawing graph and a
+  single GUI toolkit end to end (the Tkinter version's graph runs through
+  matplotlib's own window management, which is a second, independent Tk
+  interpreter in the same process - see "Diagnosing a frozen graph" below).
+  Needs `pyqtgraph` (`./venvarch/bin/python -m pip install pyqtgraph`; PyQt5
+  itself is already a dependency of matplotlib's Qt backend).
+
+Run from the project root:
 
     PYTHONPATH=. python -m src.YogurtGUI
+    PYTHONPATH=. python -m src.YogurtGUIQt
 
 - **Program stages**: add/remove stages (heat to a temperature, then hold it for a
   duration). Example for Greek yogurt: 82 C held 10 min (texture + sanitizing),
@@ -134,6 +146,7 @@ the real device:
     ./venvarch/bin/python tests/test_connection_robustness.py
     ./venvarch/bin/python tests/test_settings_and_program.py
     ./venvarch/bin/python tests/test_gui.py
+    ./venvarch/bin/python tests/test_gui_qt.py
     ./venvarch/bin/python tests/test_overshoot_fix.py
     ./venvarch/bin/python tests/test_robustness_hardening.py
 

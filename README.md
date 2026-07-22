@@ -104,45 +104,6 @@ scale.
   for fixing tunings that are visibly wrong (e.g. persistent oscillation from
   a profile tuned at a very different temperature or in a different medium),
   not something to run routinely.
-- **PID optimizer**: an alternative to the relay method that runs *while the
-  ferment stays put* - it never touches the setpoint, only Kp/Ki/Kd. Click
-  "Start optimizer" while the program is holding; click again ("Stop
-  optimizer") to freeze whatever tunings it has found (the Kp/Ki/Kd fields
-  update live, so "Save profile" captures them). "Max swing (C)" (default 3)
-  is a real safety limit, not just a small-steps hope: if the temperature
-  ever strays past it, tunings are immediately reverted (or backed off hard,
-  if the starting tunings themselves never got the chance to prove safe) and
-  the optimizer waits out a cooldown before trying again. It also only ever
-  starts adapting once the temperature has genuinely *settled* near target
-  for a few minutes (not just touched it once) - heat already stored in the
-  pot's element from getting there keeps arriving for a while regardless of
-  the cons tunings, so judging a fresh approach as "safe" too early is
-  exactly how a software-only reaction can still be too slow to prevent an
-  overshoot. Much slower to converge than the relay method, but the
-  temperature barely moves the whole time, which is why this exists:
-  retuning near an active, living culture without disrupting it.
-
-  The current strategy (`src/MinPOptimizer.py`) minimizes Kp as far as it
-  will go, then introduces just enough Ki to keep the temperature holding
-  once P alone can no longer do it - on a slow, thermal-mass-heavy process
-  read through a quantized sensor (MAX6675) and driven by a coarse
-  actuator, a high Kp mostly adds oscillation/noise amplification, and I is
-  what actually cancels the steady heat-loss-driven offset. It runs in two
-  phases: `lowering_p` steps Kp down each window it still holds within a
-  drift threshold (down to literally 0.0 if the process holds fine with
-  none at all); as soon as one window drifts, Kp is stepped back up to the
-  last value that held and `raising_i` takes over, stepping Ki up until the
-  drift is gone. This replaced an earlier IAE-gradient-descent strategy
-  (`src/PIDOptimizer.py`, still present but no longer used by the GUI
-  button) that, tried live on the real fermenter, never actually converged:
-  the *same* Kp scored an IAE of 125.82 in one window and 379.41 in
-  another, meaning real process noise/disturbances were swamping the small
-  window-to-window signal a gradient estimate depends on. The new
-  strategy only ever asks "did the temperature hold for a whole window,
-  yes or no" - a much more robust question given that noise. See
-  `tests/test_minpoptimizer.py` for the simulated safety/convergence
-  scenarios (bad starting tunings, cold approach with extreme Kp, mid-hold
-  disturbance, forced Ki search, trip-resumes-same-phase).
 - **Start program / Stop**: "Stop (keep heating)" leaves the MCU holding its last
   setpoint (the MCU is autonomous); "Stop & heater off" sends SetSP(1) first.
 - **Refresh graph**: requests the graph window be closed and reopened; the
@@ -215,11 +176,6 @@ Example:
   written (default `300`)
 - `YOGURT_GRAPH_DIAG_SLOW_MS` - a single redraw call taking longer than this
   is logged immediately (default `250`)
-- `YOGURT_OPTIMIZER_WINDOW_SECONDS` - PID optimizer evaluation window length
-  (default `900`, i.e. 15 min)
-- `YOGURT_OPTIMIZER_SETTLE_SECONDS` - how long the temperature must stay
-  continuously near target before the optimizer trusts it as settled and
-  starts adapting (default `300`, i.e. 5 min)
 
 ## Diagnosing a frozen graph
 
@@ -354,8 +310,6 @@ the real device:
     ./venvarch/bin/python tests/test_gui_qt.py
     ./venvarch/bin/python tests/test_overshoot_fix.py
     ./venvarch/bin/python tests/test_robustness_hardening.py
-    ./venvarch/bin/python tests/test_pidoptimizer.py
-    ./venvarch/bin/python tests/test_minpoptimizer.py
 
 `tests/test_graph_refresh.py` needs a real display (it drives the actual
 interactive graph window, not the headless Agg backend used by the tests

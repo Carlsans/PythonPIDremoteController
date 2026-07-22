@@ -19,10 +19,9 @@ from src.NetworkConfiguration import NetworkConfiguration
 
 
 def formatpid(value):
-    """Kp/Ki/Kd values often come from autotune/the optimizer with a dozen+
-    decimal digits of floating-point noise - 5 decimal digits is already
-    far more precision than the tuning process or the firmware's own
-    resolution can use."""
+    """Kp/Ki/Kd values often come from autotune with a dozen+ decimal digits
+    of floating-point noise - 5 decimal digits is already far more precision
+    than the tuning process or the firmware's own resolution can use."""
     return str(round(float(value), 5))
 
 
@@ -127,10 +126,6 @@ class YogourtFermenter():
         self.diaglastheartbeat = 0.0
         self.diagredrawcount = 0
         self.diagmaxredrawms = 0.0
-        # Optional online PID optimizer (see src/PIDOptimizer.py), set by the
-        # GUI's "Start optimizer" button. Runs alongside pidprogram mode,
-        # never replaces it - it only nudges the cons Kp/Ki/Kd over time.
-        self.pidoptimizer = None
         # Per-second-task pacing for the control loop; shared by the blocking
         # listeningloop() and the PyQt GUI's timer-driven steponce() calls.
         self._loop_lastsec = None
@@ -642,8 +637,6 @@ class YogourtFermenter():
         self.safecall("checkconnection", self.checkconnection)
         if self.mode == 'relayautotune':
             self.safecall("relayautotune.update", self.relayautotune.update, self.currenttemp)
-        if self.pidoptimizer is not None:
-            self.safecall("pidoptimizer.update", self.pidoptimizer.update, self.currenttemp)
         self._loopcount += 1
         if self._loopcount > 5:
             self._loopcount = 0

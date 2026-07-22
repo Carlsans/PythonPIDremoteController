@@ -23,7 +23,6 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
-from src.MinPOptimizer import MinPOptimizer
 
 # HiDPI/4K support. `ttk.Entry`/`Combobox` widths are character-based and
 # scale on their own once the named fonts below grow, but Tk's own DPI
@@ -65,10 +64,10 @@ def formatduration(seconds):
 
 
 def formatpid(value):
-    """Kp/Ki/Kd values often come from autotune/the optimizer with a dozen+
-    decimal digits of floating-point noise (e.g. 19.75716534933873) - 5
-    decimal digits is already far more precision than the tuning process
-    or the firmware's own resolution can use."""
+    """Kp/Ki/Kd values often come from autotune with a dozen+ decimal digits
+    of floating-point noise (e.g. 19.75716534933873) - 5 decimal digits is
+    already far more precision than the tuning process or the firmware's own
+    resolution can use."""
     return str(round(float(value), 5))
 
 from src.SettingsStore import SettingsStore
@@ -93,11 +92,9 @@ class YogurtGUI:
         self.buildstagesection(body)
         self.buildpidsection(body)
         self.buildautotunesection(body)
-        self.buildoptimizersection(body)
         self.buildrunsection(body)
         self.buildprogresssection(body)
         self.lastprogressupdate = 0.0
-        self.lastoptimizerupdate = 0.0
         self.refreshstages()
         self.refreshprograms()
         self.refreshprofiles()
@@ -505,90 +502,11 @@ class YogurtGUI:
                           stagetunings=self.resolvestagetunings(resumestages))
 
     # ------------------------------------------------------------------
-    # Online PID optimizer
-    # ------------------------------------------------------------------
-    def buildoptimizersection(self, parent):
-        frame = ttk.LabelFrame(parent, text="PID optimizer (online, gentle - minimize P, ratchet up I)", padding=8)
-        frame.grid(row=3, column=0, sticky="ew", pady=4)
-        ttk.Label(frame, text="Max swing (C):").grid(row=0, column=0)
-        self.optimizermaxswingentry = ttk.Entry(frame, width=6)
-        self.optimizermaxswingentry.insert(0, "3.0")
-        self.optimizermaxswingentry.grid(row=0, column=1, padx=4)
-        self.optimizerbutton = ttk.Button(frame, text="Start optimizer",
-                                          state="disabled", command=self.toggleoptimizer)
-        self.optimizerbutton.grid(row=0, column=2, padx=4)
-        self.optimizerstatusvar = tk.StringVar(value="Not running")
-        ttk.Label(frame, textvariable=self.optimizerstatusvar, justify="left").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-    def toggleoptimizer(self):
-        if self.fermenter is None or self.fermenter.mode != 'pidprogram':
-            return
-        if self.fermenter.pidoptimizer is not None:
-            self.fermenter.pidoptimizer.stop()
-            self.fermenter.pidoptimizer = None
-            self.optimizerbutton.configure(text="Start optimizer")
-            self.optimizerstatusvar.set("Stopped")
-            return
-        try:
-            maxswing = float(self.optimizermaxswingentry.get())
-        except ValueError:
-            messagebox.showerror("PID optimizer", "Max swing must be a number.")
-            return
-        try:
-            starttunings = {"Kp": float(self.pidentries["Kp"].get()),
-                            "Ki": float(self.pidentries["Ki"].get()),
-                            "Kd": float(self.pidentries["Kd"].get())}
-        except ValueError:
-            messagebox.showerror("PID optimizer", "Kp, Ki and Kd must be numbers.")
-            return
-        self.fermenter.pidoptimizer = MinPOptimizer(
-            self.fermenter, starttunings, maxswing=maxswing,
-            windowseconds=float(os.environ.get('YOGURT_OPTIMIZER_WINDOW_SECONDS', 15 * 60)),
-            settleseconds=float(os.environ.get('YOGURT_OPTIMIZER_SETTLE_SECONDS', 5 * 60)),
-            onstatechange=lambda msg: self.setstatus("Optimizer: " + msg))
-        self.optimizerbutton.configure(text="Stop optimizer")
-        self.optimizerstatusvar.set("Running - waiting to settle near target")
-
-    def updateoptimizerstatus(self):
-        now = time.time()
-        if now - self.lastoptimizerupdate < 1.0:
-            return
-        self.lastoptimizerupdate = now
-        fermenter = self.fermenter
-        if fermenter is None or fermenter.pidoptimizer is None:
-            return
-        progress = fermenter.pidoptimizer.getprogress()
-        tunings = progress["tunings"]
-        text = ("State: " + progress["state"]
-               + "  |  Kp=" + str(round(tunings["Kp"], 5)) + " Ki=" + str(round(tunings["Ki"], 6))
-               + " Kd=" + str(round(tunings["Kd"], 5)))
-        if progress["state"] in ('lowering_p', 'raising_i', 'holding'):
-            text += ("\nWindow: " + formatduration(progress["window_elapsed_s"]) + " / "
-                    + formatduration(progress["window_seconds"])
-                    + "  mean err so far=" + str(round(progress["current_meanerror"], 3))
-                    + "  max err so far=" + str(round(progress["current_maxerr"], 3)) + " C")
-        elif progress["state"] == 'cooldown':
-            text += "\nCooldown remaining: " + formatduration(progress["cooldown_remaining_s"])
-        elif progress["settling"]:
-            text += "\nSettling: " + formatduration(progress["settle_remaining_s"]) + " remaining"
-        text += "\nWindows completed: " + str(progress["windows_done"])
-        # Reflect the live tunings in the profile entries too, so "Save
-        # profile" naturally captures whatever the optimizer has found.
-        for key in ("Kp", "Ki", "Kd"):
-            entry = self.pidentries[key]
-            newvalue = formatpid(tunings[key])
-            if entry.get() != newvalue:
-                entry.delete(0, "end")
-                entry.insert(0, newvalue)
-        self.optimizerstatusvar.set(text)
-
-    # ------------------------------------------------------------------
     # Run / stop
     # ------------------------------------------------------------------
     def buildrunsection(self, parent):
         frame = ttk.Frame(parent, padding=8)
-        frame.grid(row=4, column=0, sticky="ew", pady=4)
+        frame.grid(row=3, column=0, sticky="ew", pady=4)
         self.startbutton = ttk.Button(frame, text="Start program", command=self.startprogram)
         self.startbutton.grid(row=0, column=0, padx=4)
         self.stopbutton = ttk.Button(frame, text="Stop (keep heating)", state="disabled",
@@ -640,7 +558,6 @@ class YogurtGUI:
         self.refreshgraphbutton["state"] = "normal"
         # Only meaningful while a staged program (not an autotune) is active.
         self.autotuneherebutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
-        self.optimizerbutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
         self.applylivebutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
         self.setstatus(statustext)
         try:
@@ -660,10 +577,7 @@ class YogurtGUI:
                 self.stopoffbutton["state"] = "disabled"
                 self.refreshgraphbutton["state"] = "disabled"
                 self.autotuneherebutton["state"] = "disabled"
-                self.optimizerbutton["state"] = "disabled"
                 self.applylivebutton["state"] = "disabled"
-                self.optimizerbutton.configure(text="Start optimizer")
-                self.optimizerstatusvar.set("Not running")
                 self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
                 self.progressvar.set("Idle - nothing running")
         if self.closing:
@@ -674,7 +588,7 @@ class YogurtGUI:
     # ------------------------------------------------------------------
     def buildprogresssection(self, parent):
         frame = ttk.LabelFrame(parent, text="Progress", padding=8)
-        frame.grid(row=5, column=0, sticky="ew", pady=4)
+        frame.grid(row=4, column=0, sticky="ew", pady=4)
         self.progressvar = tk.StringVar(value="Idle - nothing running")
         ttk.Label(frame, textvariable=self.progressvar, justify="left").grid(row=0, column=0, sticky="w")
 
@@ -716,7 +630,6 @@ class YogurtGUI:
                 self.fermenter.stoprequested = True
             return
         self.updateprogress()
-        self.updateoptimizerstatus()
         self.root.update()
 
     def stop(self, heateroff=False):

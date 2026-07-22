@@ -80,12 +80,6 @@ class SimulatedMCUPID:
         self.ki = ki
         self.kd = kd
 
-    def resetintegral(self):
-        """Matches the real firmware: its SetSP handler always calls
-        myPID.Initialize()+Reset(), even if the value did not change."""
-        self.iterm = 0.0
-        self.lastinput = None
-
     def compute(self, measured):
         error = self.setpoint - measured
         self.iterm += self.ki * error
@@ -132,27 +126,11 @@ class FakeController:
         self.overridepid = None
         self.pidcalls = []
         self.overridecalls = 0
-        self.sentmessages = []
 
     def setSP(self, sp):
         self.SP = sp
         self.currentSP = sp
         self.pid.setpoint = sp
-
-    def sendMessage(self, message):
-        """Raw send, matching YogourtFermenter.sendMessage() - unconditional,
-        unlike setSP() which the real code only sends if the value changed.
-        Used to test PIDOptimizer's integral-reset-via-resend safety trick:
-        the real firmware's SetSP handler always resets the integral, even
-        for an unchanged value (see OTAInputOutput.h)."""
-        self.sentmessages.append(message)
-        if message.startswith("SetSP("):
-            value = float(message[len("SetSP("):-1])
-            self.SP = value
-            self.currentSP = value
-            self.pid.setpoint = value
-            if hasattr(self.pid, 'resetintegral'):
-                self.pid.resetintegral()
 
     def setAllPID(self, kp, ki, kd):
         self.pidcalls.append((kp, ki, kd))

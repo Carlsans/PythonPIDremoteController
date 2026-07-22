@@ -20,9 +20,39 @@ import copy
 import os
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
-from src.PIDOptimizer import PIDOptimizer
+from src.MinPOptimizer import MinPOptimizer
+
+# HiDPI/4K support. `ttk.Entry`/`Combobox` widths are character-based and
+# scale on their own once the named fonts below grow, but Tk's own DPI
+# probe (winfo_fpixels) is often wrong on Linux (many X servers/compositors
+# misreport it), leaving fonts tiny on a 4K screen even though the widgets
+# around them look normal-sized. YOGURT_UI_SCALE, if set, overrides the
+# computed Tk scaling factor directly; YOGURT_UI_FONT_PT sets the base
+# point size applied to every named Tk font (default 13, vs Tk's ~9-10
+# default - genuinely small on a 4K panel).
+UIFONTPT = int(os.environ.get('YOGURT_UI_FONT_PT', 16))
+
+
+def applyuiscaling(root):
+    override = os.environ.get('YOGURT_UI_SCALE')
+    if override:
+        root.tk.call('tk', 'scaling', float(override))
+    else:
+        dpi = root.winfo_fpixels('1i')
+        root.tk.call('tk', 'scaling', dpi / 72.0)
+    for fontname in ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont",
+                     "TkFixedFont", "TkIconFont", "TkCaptionFont", "TkSmallCaptionFont"):
+        try:
+            tkfont.nametofont(fontname).configure(size=UIFONTPT)
+        except tk.TclError:
+            pass
+
+
+def scaledpx(pixels):
+    return int(round(pixels * UIFONTPT / 9.0))
 
 
 def formatduration(seconds):
@@ -32,6 +62,14 @@ def formatduration(seconds):
     hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
     return "%d:%02d:%02d" % (hours, minutes, seconds)
+
+
+def formatpid(value):
+    """Kp/Ki/Kd values often come from autotune/the optimizer with a dozen+
+    decimal digits of floating-point noise (e.g. 19.75716534933873) - 5
+    decimal digits is already far more precision than the tuning process
+    or the firmware's own resolution can use."""
+    return str(round(float(value), 5))
 
 from src.SettingsStore import SettingsStore
 from src.yogurtdata import YogourtFermenter, SingleInstanceError
@@ -47,6 +85,7 @@ class YogurtGUI:
         self._inplacepending = None
 
         self.root = tk.Tk()
+        applyuiscaling(self.root)
         self.root.title("Yogurt Fermenter")
         self.root.protocol("WM_DELETE_WINDOW", self.onclose)
         body = ttk.Frame(self.root, padding=10)
@@ -69,11 +108,16 @@ class YogurtGUI:
     def buildstagesection(self, parent):
         frame = ttk.LabelFrame(parent, text="Program stages (heat to temp, then hold for duration)", padding=8)
         frame.grid(row=0, column=0, sticky="ew", pady=4)
-        self.stagetree = ttk.Treeview(frame, columns=("temp", "minutes"), show="headings", height=4)
+        self.stagetree = ttk.Treeview(frame, columns=("temp", "minutes", "profile", "approach"),
+                                      show="headings", height=4)
         self.stagetree.heading("temp", text="Temperature (C)")
         self.stagetree.heading("minutes", text="Hold (minutes)")
-        self.stagetree.column("temp", width=140, anchor="center")
-        self.stagetree.column("minutes", width=140, anchor="center")
+        self.stagetree.heading("profile", text="PID profile")
+        self.stagetree.heading("approach", text="Approach")
+        self.stagetree.column("temp", width=scaledpx(140), anchor="center")
+        self.stagetree.column("minutes", width=scaledpx(140), anchor="center")
+        self.stagetree.column("profile", width=scaledpx(160), anchor="center")
+        self.stagetree.column("approach", width=scaledpx(110), anchor="center")
         self.stagetree.grid(row=0, column=0, columnspan=6, sticky="ew")
 
         ttk.Label(frame, text="Temp (C):").grid(row=1, column=0, pady=4)
@@ -85,17 +129,36 @@ class YogurtGUI:
         ttk.Button(frame, text="Add stage", command=self.addstage).grid(row=1, column=4, padx=4)
         ttk.Button(frame, text="Remove selected", command=self.removestage).grid(row=1, column=5, padx=4)
 
-        ttk.Label(frame, text="Saved programs:").grid(row=2, column=0, pady=4)
+        ttk.Label(frame, text="Stage's PID profile:").grid(row=2, column=0, pady=4)
+        self.stageprofilebox = ttk.Combobox(frame, width=18)
+        self.stageprofilebox.grid(row=2, column=1, sticky="w", padx=4)
+        ttk.Button(frame, text="Assign to selected", command=self.assignstageprofile).grid(
+            row=2, column=2, columnspan=2, padx=2, sticky="w")
+        ttk.Label(frame, text="(blank = use the active profile above)").grid(
+            row=2, column=4, columnspan=2, sticky="w")
+
+        self.fastapproachvar = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Fast approach (allow overshoot)",
+                        variable=self.fastapproachvar).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Button(frame, text="Toggle for selected", command=self.togglestagefastapproach).grid(
+            row=3, column=2, padx=2, sticky="w")
+        ttk.Label(frame, text="(skips the gentle setpoint ramp - faster, but can overshoot)").grid(
+            row=3, column=3, columnspan=3, sticky="w")
+
+        ttk.Label(frame, text="Saved programs:").grid(row=4, column=0, pady=4)
         self.programbox = ttk.Combobox(frame, width=18)
-        self.programbox.grid(row=2, column=1, columnspan=2, sticky="w", padx=4)
-        ttk.Button(frame, text="Save", command=self.saveprogram).grid(row=2, column=3, padx=2)
-        ttk.Button(frame, text="Load", command=self.loadprogram).grid(row=2, column=4, padx=2)
-        ttk.Button(frame, text="Delete", command=self.deleteprogram).grid(row=2, column=5, padx=2)
+        self.programbox.grid(row=4, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Button(frame, text="Save", command=self.saveprogram).grid(row=4, column=3, padx=2)
+        ttk.Button(frame, text="Load", command=self.loadprogram).grid(row=4, column=4, padx=2)
+        ttk.Button(frame, text="Delete", command=self.deleteprogram).grid(row=4, column=5, padx=2)
 
     def refreshstages(self):
         self.stagetree.delete(*self.stagetree.get_children())
         for stage in self.settings["stages"]:
-            self.stagetree.insert("", "end", values=(stage["temperature"], stage["duration_minutes"]))
+            self.stagetree.insert("", "end", values=(
+                stage["temperature"], stage["duration_minutes"],
+                stage.get("profile") or "(active profile)",
+                "fast" if stage.get("fast_approach") else "gentle"))
 
     def addstage(self):
         try:
@@ -110,7 +173,13 @@ class YogurtGUI:
         if minutes < 0:
             messagebox.showerror("Invalid stage", "Hold minutes cannot be negative.")
             return
-        self.settings["stages"].append({"temperature": temperature, "duration_minutes": minutes})
+        stage = {"temperature": temperature, "duration_minutes": minutes}
+        profile = self.stageprofilebox.get().strip()
+        if profile:
+            stage["profile"] = profile
+        if self.fastapproachvar.get():
+            stage["fast_approach"] = True
+        self.settings["stages"].append(stage)
         self.store.save(self.settings)
         self.refreshstages()
 
@@ -124,6 +193,52 @@ class YogurtGUI:
             del self.settings["stages"][index]
         self.store.save(self.settings)
         self.refreshstages()
+
+    def assignstageprofile(self):
+        selected = self.stagetree.selection()
+        if not selected:
+            messagebox.showinfo("Assign profile", "Select one or more stages first.")
+            return
+        profile = self.stageprofilebox.get().strip()
+        if profile and profile not in self.settings["pid_profiles"]:
+            messagebox.showerror("Assign profile", "No saved PID profile named '" + profile + "'.")
+            return
+        for item in selected:
+            index = self.stagetree.index(item)
+            if profile:
+                self.settings["stages"][index]["profile"] = profile
+            else:
+                self.settings["stages"][index].pop("profile", None)
+        self.store.save(self.settings)
+        self.refreshstages()
+
+    def togglestagefastapproach(self):
+        """Sets selected stages' fast_approach flag to whatever the
+        checkbox currently shows (not a per-row toggle - the checkbox is
+        the value being applied, matching "Assign to selected" above)."""
+        selected = self.stagetree.selection()
+        if not selected:
+            messagebox.showinfo("Fast approach", "Select one or more stages first.")
+            return
+        fast = self.fastapproachvar.get()
+        for item in selected:
+            index = self.stagetree.index(item)
+            if fast:
+                self.settings["stages"][index]["fast_approach"] = True
+            else:
+                self.settings["stages"][index].pop("fast_approach", None)
+        self.store.save(self.settings)
+        self.refreshstages()
+
+    def resolvestagetunings(self, stages):
+        """(Kp, Ki, Kd) per stage, or None where the stage has no profile of
+        its own - PIDProgram falls back to the globally selected profile."""
+        result = []
+        for stage in stages:
+            name = stage.get("profile")
+            profile = self.settings["pid_profiles"].get(name) if name else None
+            result.append((profile["Kp"], profile["Ki"], profile["Kd"]) if profile else None)
+        return result
 
     # ------------------------------------------------------------------
     # Saved stage programs
@@ -184,10 +299,14 @@ class YogurtGUI:
             self.pidentries[name] = entry
         ttk.Button(frame, text="Save profile", command=self.saveprofile).grid(row=2, column=1, pady=4)
         ttk.Button(frame, text="Delete profile", command=self.deleteprofile).grid(row=2, column=3, pady=4)
+        self.applylivebutton = ttk.Button(frame, text="Apply now (live)", state="disabled",
+                                          command=self.applylivetunings)
+        self.applylivebutton.grid(row=2, column=4, pady=4)
 
     def refreshprofiles(self):
         names = sorted(self.settings["pid_profiles"].keys())
         self.profilebox["values"] = names
+        self.stageprofilebox["values"] = [""] + names
         active = self.settings.get("active_profile")
         if active not in self.settings["pid_profiles"]:
             active = names[0] if names else ""
@@ -201,7 +320,7 @@ class YogurtGUI:
             return
         for key, entry in self.pidentries.items():
             entry.delete(0, "end")
-            entry.insert(0, str(profile[key]))
+            entry.insert(0, formatpid(profile[key]))
 
     def onprofileselected(self, event=None):
         name = self.profilebox.get()
@@ -239,6 +358,20 @@ class YogurtGUI:
         self.store.save(self.settings)
         self.refreshprofiles()
         self.setstatus("Deleted profile '" + name + "'")
+
+    def applylivetunings(self):
+        """Push the Kp/Ki/Kd entries to the running controller immediately,
+        without stopping the program or waiting for the next stage change -
+        for tweaking a profile by hand while watching the graph."""
+        if self.fermenter is None:
+            return
+        try:
+            kp, ki, kd = self.currenttunings()
+        except ValueError:
+            messagebox.showerror("Apply now", "Kp, Ki and Kd must be numbers.")
+            return
+        self.fermenter.setconsPIDvalues(kp, ki, kd)
+        self.setstatus("Applied live tunings: Kp=" + str(kp) + " Ki=" + str(ki) + " Kd=" + str(kd))
 
     def saveautotuneresult(self, label, result):
         """Store an autotune result as a named profile (called when it finishes)."""
@@ -368,13 +501,14 @@ class YogurtGUI:
         self.store.save(self.settings)
         self.refreshstages()
         self.runfermenter("Program resumed with in-place tunings (profile '" + label + "')...",
-                          mode='pidprogram', stages=resumestages, tunings=tunings)
+                          mode='pidprogram', stages=resumestages, tunings=tunings,
+                          stagetunings=self.resolvestagetunings(resumestages))
 
     # ------------------------------------------------------------------
     # Online PID optimizer
     # ------------------------------------------------------------------
     def buildoptimizersection(self, parent):
-        frame = ttk.LabelFrame(parent, text="PID optimizer (online, gentle - IAE gradient descent)", padding=8)
+        frame = ttk.LabelFrame(parent, text="PID optimizer (online, gentle - minimize P, ratchet up I)", padding=8)
         frame.grid(row=3, column=0, sticky="ew", pady=4)
         ttk.Label(frame, text="Max swing (C):").grid(row=0, column=0)
         self.optimizermaxswingentry = ttk.Entry(frame, width=6)
@@ -408,7 +542,7 @@ class YogurtGUI:
         except ValueError:
             messagebox.showerror("PID optimizer", "Kp, Ki and Kd must be numbers.")
             return
-        self.fermenter.pidoptimizer = PIDOptimizer(
+        self.fermenter.pidoptimizer = MinPOptimizer(
             self.fermenter, starttunings, maxswing=maxswing,
             windowseconds=float(os.environ.get('YOGURT_OPTIMIZER_WINDOW_SECONDS', 15 * 60)),
             settleseconds=float(os.environ.get('YOGURT_OPTIMIZER_SETTLE_SECONDS', 5 * 60)),
@@ -426,13 +560,13 @@ class YogurtGUI:
             return
         progress = fermenter.pidoptimizer.getprogress()
         tunings = progress["tunings"]
-        text = ("State: " + progress["state"] + "  |  tuning " + progress["param"]
+        text = ("State: " + progress["state"]
                + "  |  Kp=" + str(round(tunings["Kp"], 5)) + " Ki=" + str(round(tunings["Ki"], 6))
                + " Kd=" + str(round(tunings["Kd"], 5)))
-        if progress["state"] == 'running':
+        if progress["state"] in ('lowering_p', 'raising_i', 'holding'):
             text += ("\nWindow: " + formatduration(progress["window_elapsed_s"]) + " / "
                     + formatduration(progress["window_seconds"])
-                    + "  IAE so far=" + str(round(progress["current_iae"], 1))
+                    + "  mean err so far=" + str(round(progress["current_meanerror"], 3))
                     + "  max err so far=" + str(round(progress["current_maxerr"], 3)) + " C")
         elif progress["state"] == 'cooldown':
             text += "\nCooldown remaining: " + formatduration(progress["cooldown_remaining_s"])
@@ -443,7 +577,7 @@ class YogurtGUI:
         # profile" naturally captures whatever the optimizer has found.
         for key in ("Kp", "Ki", "Kd"):
             entry = self.pidentries[key]
-            newvalue = str(tunings[key])
+            newvalue = formatpid(tunings[key])
             if entry.get() != newvalue:
                 entry.delete(0, "end")
                 entry.insert(0, newvalue)
@@ -492,9 +626,10 @@ class YogurtGUI:
             messagebox.showerror("Start program", "Kp, Ki and Kd must be numbers.")
             return
         self.store.save(self.settings)
+        stages = list(self.settings["stages"])
         self.runfermenter("Program running (profile '" + self.profilebox.get() + "')...",
-                          mode='pidprogram', stages=list(self.settings["stages"]),
-                          tunings=tunings)
+                          mode='pidprogram', stages=stages,
+                          tunings=tunings, stagetunings=self.resolvestagetunings(stages))
 
     def runfermenter(self, statustext, **kwargs):
         self.running = True
@@ -506,6 +641,7 @@ class YogurtGUI:
         # Only meaningful while a staged program (not an autotune) is active.
         self.autotuneherebutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
         self.optimizerbutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
+        self.applylivebutton["state"] = "normal" if kwargs.get('mode') == 'pidprogram' else "disabled"
         self.setstatus(statustext)
         try:
             self.fermenter = YogourtFermenter(ontick=self.ontick, autorun=False, **kwargs)
@@ -525,6 +661,7 @@ class YogurtGUI:
                 self.refreshgraphbutton["state"] = "disabled"
                 self.autotuneherebutton["state"] = "disabled"
                 self.optimizerbutton["state"] = "disabled"
+                self.applylivebutton["state"] = "disabled"
                 self.optimizerbutton.configure(text="Start optimizer")
                 self.optimizerstatusvar.set("Not running")
                 self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")

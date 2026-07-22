@@ -7,10 +7,28 @@ class PIDProgram:
     temperature, then hold it for the stage duration before moving on.
 
     `stages` is a list of dicts: {"temperature": C, "duration_minutes": min,
-    "override_pid": bool (optional)}. When omitted, the historical default
-    (39 C held for 24 h) is used.
+    "override_pid": bool (optional), "fast_approach": bool (optional)}. When
+    omitted, the historical default (39 C held for 24 h) is used.
+
+    `fast_approach` (default False) skips the setpoint ramp for that stage's
+    approach (see updateapproachramp()): the full target is sent immediately,
+    so the firmware's aggressive (full-power) profile drives the climb the
+    whole way instead of being capped to trickle in behind the measured
+    temperature. Faster, at the cost of the stored-heat overshoot the ramp
+    exists to prevent - useful for a stage like an 82 C sanitizing hold where
+    a few degrees of overshoot are harmless but a slow approach is not worth
+    the wait, unlike a stage holding near a live, temperature-sensitive
+    culture.
+
+    `stagetunings`, if given, is a list of (Kp, Ki, Kd) tuples aligned with
+    `stages` - a stage's own entry (when not None) is applied as the cons
+    profile whenever that stage becomes current (at program start and on
+    every stage transition), letting each stage of a program use a
+    different PID profile (e.g. a stiffer one for an 82 C sanitizing stage,
+    a gentler one for a 38 C hold). A stage with no entry (None) falls back
+    to `tunings`, the single profile used before this existed.
     """
-    def __init__(self,controller, stages=None, tunings=None, timesource=time.time,
+    def __init__(self,controller, stages=None, tunings=None, stagetunings=None, timesource=time.time,
                  approachtunings=(100.0, 0.0, 0.0),
                  ramprate=0.5 / 60.0, rampzone=10.0):
         self.controller = controller
@@ -18,6 +36,8 @@ class PIDProgram:
         self.programstarttime = self.now()
         if tunings is None:
             tunings = (20, .02, .4)  # "medium-pot-5-jars" profile
+        self.tunings = tunings
+        self.stagetunings = list(stagetunings) if stagetunings else []
         # The firmware uses the aggressive profile while |SP - temp| >= 4.5 C
         # and the conservative one when closer. The profile the user tuned
         # goes in cons (it holds the temperature); agg gets pure P with Ki=0
@@ -25,7 +45,6 @@ class PIDProgram:
         # what caused massive overshoot when heating to a low setpoint like
         # 38 C, where the pot barely cools passively. (Setting both profiles
         # to the same PI, as setAllPID did, defeats this firmware feature.)
-        self.controller.setconsPIDvalues(tunings[0], tunings[1], tunings[2])
         self.controller.setaggPIDvalues(approachtunings[0], approachtunings[1], approachtunings[2])
         try:
             chime.theme('zelda')
@@ -46,6 +65,7 @@ class PIDProgram:
         else:
             self.effects = ["chime" for i in self.waitsecondsaftertempreached]
         self.overridepid = [bool(s.get("override_pid", False)) for s in stages]
+        self.fastapproach = [bool(s.get("fast_approach", False)) for s in stages]
 
         # Setpoint ramp for upward approaches. The pot stores a lot of heat in
         # its element/bottom during a full-power climb (~8 C worth on the real
@@ -68,6 +88,14 @@ class PIDProgram:
         self.controller.overridepid = self.overridepid[self.currentstage]
         if self.overridepid[self.currentstage]:
             self.controller.setPIDOverride()
+        self.applystagetunings(self.currentstage)
+
+    def applystagetunings(self, stageindex):
+        """Apply the cons profile for `stageindex`: its own tunings if the
+        stage specifies one, otherwise the program's fallback `tunings`."""
+        stagespecific = self.stagetunings[stageindex] if stageindex < len(self.stagetunings) else None
+        kp, ki, kd = stagespecific if stagespecific else self.tunings
+        self.controller.setconsPIDvalues(kp, ki, kd)
 
     def getprogress(self):
         """Snapshot of where the program is, for display in the GUI.
@@ -119,10 +147,12 @@ class PIDProgram:
         temp = self.controller.currenttemp
         if self.temperaturehasbeenreached or temp <= 0:
             return
-        if target <= temp + 0.25 or target - temp > self.rampzone:
-            # Approaching from above (no active cooling, ramp is pointless) or
-            # still far below: direct setpoint (the aggressive profile gives
-            # full power until the ramp zone).
+        if target <= temp + 0.25 or target - temp > self.rampzone or self.fastapproach[self.currentstage]:
+            # Approaching from above (no active cooling, ramp is pointless),
+            # still far below, or this stage opted out of the ramp entirely
+            # (fast_approach): direct setpoint, so the aggressive profile
+            # gives full power all the way to target instead of being capped
+            # to trickle in behind the measured temperature.
             self.rampstart = None
             self.controller.setSP(target)
             return
@@ -186,4 +216,5 @@ class PIDProgram:
                 self.controller.overridepid = self.overridepid[self.currentstage]
                 if self.overridepid[self.currentstage]:
                     self.controller.setPIDOverride()
+                self.applystagetunings(self.currentstage)
                 print("Waiting time ended, next target temperature :",self.controller.SP)

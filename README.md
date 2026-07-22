@@ -22,13 +22,69 @@ Run from the project root:
     PYTHONPATH=. python -m src.YogurtGUI
     PYTHONPATH=. python -m src.YogurtGUIQt
 
+### Running the Qt GUI natively on Wayland (recommended on a Wayland desktop)
+
+On a Wayland desktop (e.g. niri) the normal venv's PyQt5 has no Wayland
+platform plugin, so `src.YogurtGUIQt` runs through **XWayland** - which on
+this setup (niri + `xwayland-satellite`) stops presenting the window when it
+is left off a visible workspace or on an idle-blanked output, so the window
+"freezes" while the process stays perfectly healthy (see "long-run freeze,
+part 3" below). Run it as a **native Wayland** client instead:
+
+    ./run_gui_wayland.sh
+
+That launcher uses a separate `venvwayland` virtualenv - a
+`--system-site-packages` venv on the system Python, so it picks up the
+**system Qt** (which *does* ship the Wayland platform plugin) plus system
+numpy/matplotlib, with `pyqtgraph` and `chime` pip-installed on top. It
+forces `QT_QPA_PLATFORM=wayland` (falling back to `xcb` if there is no
+Wayland display), overriding any global `QT_QPA_PLATFORM=xcb` the session
+sets. To (re)create the venv:
+
+    /usr/bin/python3 -m venv --system-site-packages venvwayland
+    ./venvwayland/bin/pip install pyqtgraph chime
+
+Verify it is running natively: while it is up, `xdotool search --name
+"Yogurt Fermenter"` finds **no** window (a native Wayland window is not an X
+window), and the process' `QApplication.platformName()` is `wayland`.
+
+Both scale for HiDPI/4K screens: `YOGURT_UI_FONT_PT` sets the base font
+size applied everywhere (default `13`, vs. the ~9pt Tk/Qt/matplotlib
+default that reads as genuinely tiny on a 4K panel), and widget widths /
+figure size scale with it automatically. `YOGURT_UI_SCALE` (Qt GUI only)
+overrides Qt's own DPI auto-detection directly (`QT_SCALE_FACTOR`) for
+setups where the X server/compositor misreports the screen's real DPI -
+try this first if things still look wrong at the default font size. The Qt
+GUI's graph also got a visual pass: a dark theme, a distinguishable color
+per line, a filled temperature curve, a dashed setpoint reference line, and
+a second Y axis for Output so it no longer fights the temperature curve's
+scale.
+
 - **Program stages**: add/remove stages (heat to a temperature, then hold it for a
   duration). Example for Greek yogurt: 82 C held 10 min (texture + sanitizing),
   then 40 C held 480 min. Stages are saved to `yogurt_settings.json`.
   The current stage list can be saved under a name (e.g. "greek-yogurt") and
   restored later with the Save/Load/Delete buttons.
+- **Per-stage PID profile**: each stage can use its own named PID profile
+  (e.g. a stiff one for an 82 C sanitizing stage, a gentle one for a 38 C
+  hold) - pick a profile in the "Stage's PID profile" box and click "Assign
+  to selected" on one or more selected stage rows. Leaving it blank keeps a
+  stage on whatever profile is selected below at program start (the
+  original, single-profile-for-the-whole-run behaviour).
+- **Fast approach**: a stage can skip the gentle setpoint ramp (see "Note on
+  approaches" below) entirely - check "Fast approach (allow overshoot)" and
+  click "Toggle for selected" on one or more stage rows. The full target is
+  sent immediately instead of being capped to trickle in behind the
+  measured temperature, so the firmware's aggressive full-power profile
+  drives the whole climb - faster, at the cost of the stored-heat overshoot
+  the ramp exists to prevent. Good for a stage where a few degrees of
+  overshoot are harmless (e.g. an 82 C sanitizing hold) but not for one
+  holding near a live, temperature-sensitive culture. Off by default.
 - **PID tunings**: named profiles (save/select/delete). The selected profile is
-  applied when the program starts.
+  applied when the program starts. "Apply now (live)" pushes whatever is
+  currently typed in the Kp/Ki/Kd boxes straight to the running controller
+  without stopping the program or waiting for the next stage change - for
+  tweaking a profile by hand while watching the graph.
 - **Autotune**: enter a target temperature and a profile name, press Start
   autotune. When it finishes, the tunings are saved under that name and the pot
   keeps holding the target. Use water, not milk. "Margin (C)" bounds how far
@@ -49,10 +105,8 @@ Run from the project root:
   a profile tuned at a very different temperature or in a different medium),
   not something to run routinely.
 - **PID optimizer**: an alternative to the relay method that runs *while the
-  ferment stays put* - it never touches the setpoint, only nudges Kp/Ki/Kd by
-  small steps (~7% at a time) based on the Integral of Absolute Error (IAE)
-  measured over each ~15-minute window, cycling through Kp, then Ki, then Kd.
-  Click "Start optimizer" while the program is holding; click again ("Stop
+  ferment stays put* - it never touches the setpoint, only Kp/Ki/Kd. Click
+  "Start optimizer" while the program is holding; click again ("Stop
   optimizer") to freeze whatever tunings it has found (the Kp/Ki/Kd fields
   update live, so "Save profile" captures them). "Max swing (C)" (default 3)
   is a real safety limit, not just a small-steps hope: if the temperature
@@ -64,12 +118,31 @@ Run from the project root:
   pot's element from getting there keeps arriving for a while regardless of
   the cons tunings, so judging a fresh approach as "safe" too early is
   exactly how a software-only reaction can still be too slow to prevent an
-  overshoot (see `src/PIDOptimizer.py`'s docstring and
-  `tests/test_pidoptimizer.py` for the full reasoning and the simulated
-  scenarios - including a deliberately extreme starting Kp - that motivated
-  this design). Much slower to converge than the relay method, but the
+  overshoot. Much slower to converge than the relay method, but the
   temperature barely moves the whole time, which is why this exists:
   retuning near an active, living culture without disrupting it.
+
+  The current strategy (`src/MinPOptimizer.py`) minimizes Kp as far as it
+  will go, then introduces just enough Ki to keep the temperature holding
+  once P alone can no longer do it - on a slow, thermal-mass-heavy process
+  read through a quantized sensor (MAX6675) and driven by a coarse
+  actuator, a high Kp mostly adds oscillation/noise amplification, and I is
+  what actually cancels the steady heat-loss-driven offset. It runs in two
+  phases: `lowering_p` steps Kp down each window it still holds within a
+  drift threshold (down to literally 0.0 if the process holds fine with
+  none at all); as soon as one window drifts, Kp is stepped back up to the
+  last value that held and `raising_i` takes over, stepping Ki up until the
+  drift is gone. This replaced an earlier IAE-gradient-descent strategy
+  (`src/PIDOptimizer.py`, still present but no longer used by the GUI
+  button) that, tried live on the real fermenter, never actually converged:
+  the *same* Kp scored an IAE of 125.82 in one window and 379.41 in
+  another, meaning real process noise/disturbances were swamping the small
+  window-to-window signal a gradient estimate depends on. The new
+  strategy only ever asks "did the temperature hold for a whole window,
+  yes or no" - a much more robust question given that noise. See
+  `tests/test_minpoptimizer.py` for the simulated safety/convergence
+  scenarios (bad starting tunings, cold approach with extreme Kp, mid-hold
+  disturbance, forced Ki search, trip-resumes-same-phase).
 - **Start program / Stop**: "Stop (keep heating)" leaves the MCU holding its last
   setpoint (the MCU is autonomous); "Stop & heater off" sends SetSP(1) first.
 - **Refresh graph**: requests the graph window be closed and reopened; the
@@ -167,6 +240,108 @@ window-manager/compositor-side issue - the proactive refresh should recover
 it within `YOGURT_GRAPH_REFRESH_SECONDS`), while a gap in heartbeats or a
 `SLOW_REDRAW`/exception would point at a real in-process hang instead.
 
+### The Qt GUI's long-run freeze (fixed)
+
+A third failure mode, found the hard way on a real multi-hour run of the Qt
+GUI: neither a hung redraw call nor a compositor problem, but the redraw
+being *legitimately* slow enough to starve the event loop. `updateplots()`
+redraws every curve once a second over the **whole** run history, so its
+cost grew with run length - measured at this window size, a full
+update+render took ~0.15 s at 1 h of data but ~4.2 s at the 20 h cap
+(`cleanPlotlists()`). Once one redraw takes longer than the one-second
+redraw interval, the loop does nothing but paint and the window stops
+responding to input - indistinguishable from a crash from the outside,
+which is exactly how it was first reported.
+
+Two causes, both needed fixing (measured with `tests/test_gui_qt.py`'s
+`test_plot_redraw_stays_fast_on_long_runs`, and end-to-end via event-loop
+lag against a fake ESP - median lag went from **2580 ms to 1 ms**):
+
+- **No downsampling**: every one of ~72 000 points was handed to Qt to
+  stroke, most landing on the same screen pixel. Now
+  `setDownsampling(auto=True, method='peak')` + `setClipToView(True)`: the
+  min/max envelope per pixel is kept (spikes stay visible) and off-screen
+  points are skipped.
+- **Antialiasing on wide pens**: Qt's raster engine has no fast path for
+  antialiased pens wider than 1 px - ~40 ms per dense curve per redraw,
+  across 7 curves. Antialiasing is now off globally for the graph; the
+  100-point zoom curve opts back in (`antialias=True`), where it costs
+  nothing and the smoothing is actually visible.
+
+`updateplots()` also logs a `QT_SLOW_PLOT` line to the diagnostics log if it
+ever exceeds 250 ms again, so a future regression leaves evidence instead of
+just looking like another mystery freeze.
+
+### The Qt GUI's long-run freeze, part 2: the blocking event loop (fixed)
+
+The redraw fix above was necessary but not sufficient - the window still
+froze on a multi-day run. This time a `py-spy dump` of the live frozen
+instance was decisive: the main thread was parked in
+`listeningloop()`'s `recvfrom()`, with Qt's real event loop (`app.exec_`)
+suspended on the stack behind it. The Qt GUI had inherited the Tkinter
+design where the fermenter *blocks* in `listeningloop()` and the GUI is
+repainted only by `QApplication.processEvents()` calls hand-cranked from
+inside that loop (once per socket read). That manual pump is fragile over
+long runs: the window silently stops repainting while the control loop
+keeps cycling, so from outside it looks like a crash even though the
+process is healthy and low-CPU (~10%, mostly asleep in `poll` - nothing
+like the CPU-pegged redraw-starvation above).
+
+The fix is architectural: the Qt GUI no longer blocks. `runfermenter()`
+creates the fermenter with `autorun=False`, then drives it from a `QTimer`
+(`_pumpfermenter`, 10 Hz) while Qt's own `app.exec_()` stays in charge of
+painting the normal, robust way. `listeningloop()` was factored into
+`steponce()` / `receiveone()` / `drainincoming()` / `closelistening()` so
+the blocking version still serves the Tkinter GUI and headless mode
+unchanged, while the Qt pump calls `steponce(blocking=False,
+runontick=False)` and lets Qt paint natively. Because the pump is timer-
+driven, the window now stays responsive **regardless of packet arrival** -
+verified on a real display with 20 h of history while the fake ESP goes
+silent mid-run (event-loop lag stayed at ~0 ms median). Regression test:
+`test_event_loop_stays_responsive_while_running`. The pump also writes a
+`QT_PUMP_HEARTBEAT` line to the diagnostics log every 60 s, so if the
+window ever freezes again the log immediately distinguishes "timer still
+firing" (a genuine compositor/WM-side freeze) from "pump wedged".
+
+### The Qt GUI's long-run freeze, part 3: XWayland presentation (mitigated)
+
+Even after part 2 the window still froze after a couple of hours - and this
+time the `QT_PUMP_HEARTBEAT` line the part-2 fix added settled it
+immediately: on the live frozen instance the heartbeats were **still being
+written every 60 s** (temperature and point-count advancing normally), and a
+`py-spy dump` showed the main thread idle in Qt's event loop. So the process
+and the whole control loop were completely healthy - only the on-screen
+window was frozen. This is the "compositor silently stops redrawing a
+long-lived window" mode the matplotlib GUI already guards against with
+`recreategraph` (see above); the Qt GUI just never had an equivalent.
+
+The environment is the reason: the desktop is **niri** (a Wayland
+compositor) and the venv's bundled Qt has no native Wayland platform plugin
+(only `xcb`), so the GUI runs through **XWayland**, provided by
+**`xwayland-satellite`**. When the window is somewhere the compositor stops
+compositing it (a non-visible niri workspace, or an idle-blanked output),
+frame callbacks stop and the surface can stop presenting new frames and fail
+to resume when shown again. It is not reproducible on a short timescale
+(monitor DPMS-off, and a nested-niri window hidden for 15 s, both recovered
+fine); it takes hours, so it could not be validated by fast reproduction.
+
+Mitigation (`_forcerepaint`, `YOGURT_QT_REPAINT_SECONDS`, default 2 s): a
+watchdog `QTimer` calls `self.plotwidget.viewport().repaint()` - a
+*synchronous* repaint that does not wait for a frame callback, so the app
+commits a fresh buffer every couple of seconds regardless. For the window to
+stay frozen the compositor would have to ignore our commits outright, not
+merely withhold frame-callback requests (the common XWayland-stall cause).
+It runs cleanly through the real XWayland path (verified in a nested niri +
+xwayland-satellite) and costs one extra plot repaint every 2 s.
+
+The **definitive** fix is to not go through XWayland at all: run the GUI on
+a Qt that has the Wayland platform plugin. `./run_gui_wayland.sh` does this
+(system Qt via `venvwayland`, forced `QT_QPA_PLATFORM=wayland` - see
+"Running the Qt GUI natively on Wayland" above); a native Wayland window is
+not subject to the XWayland presentation stall at all. A newer
+`xwayland-satellite` may also fix it. The repaint watchdog stays as the
+in-app best effort for anyone still running through XWayland.
+
 ## Tests
 
 Automated tests run against a simulated pot / fake ESP on localhost and never touch
@@ -180,6 +355,7 @@ the real device:
     ./venvarch/bin/python tests/test_overshoot_fix.py
     ./venvarch/bin/python tests/test_robustness_hardening.py
     ./venvarch/bin/python tests/test_pidoptimizer.py
+    ./venvarch/bin/python tests/test_minpoptimizer.py
 
 `tests/test_graph_refresh.py` needs a real display (it drives the actual
 interactive graph window, not the headless Agg backend used by the tests

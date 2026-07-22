@@ -108,6 +108,92 @@ def test_greek_yogurt_program():
           + str(round(max(finalerrors), 3)) + " C)")
 
 
+def test_per_stage_pid_profiles():
+    """Each stage can carry its own cons tunings via `stagetunings` (aligned
+    by index with `stages`); a stage with None falls back to the program's
+    single `tunings`, preserving the pre-existing behaviour for programs
+    that don't use this."""
+    controller = FakeController(SimulatedMCUPID())
+    simtime = {"t": 0.0}
+    stages = [{"temperature": 82.0, "duration_minutes": 1.0},
+              {"temperature": 40.0, "duration_minutes": 1.0},
+              {"temperature": 38.0, "duration_minutes": 1.0}]
+    stagetunings = [(50.0, 0.05, 0.0), None, (5.0, 0.01, 0.0)]
+    program = PIDProgram(controller, stages=stages, tunings=(20.0, 0.02, 0.4),
+                         stagetunings=stagetunings, timesource=lambda: simtime["t"])
+
+    # Stage 0 has its own profile, applied at construction.
+    assert ("cons", 50.0, 0.05, 0.0) in controller.pidcalls
+    controller.pidcalls.clear()
+
+    # Advance to stage 1 (temperature reached + hold elapses): stage 1 has
+    # no profile of its own, so the fallback `tunings` must be applied.
+    controller.currenttemp = 82.0
+    simtime["t"] = 1.0
+    program.applyProgram()
+    assert program.temperaturehasbeenreached
+    simtime["t"] = 1.0 + 60.0 + 1
+    program.applyProgram()
+    assert program.currentstage == 1
+    assert controller.SP == 40.0
+    assert ("cons", 20.0, 0.02, 0.4) in controller.pidcalls, \
+        "stage without its own profile must fall back to the program's tunings"
+    controller.pidcalls.clear()
+
+    # Advance to stage 2: has its own profile again.
+    controller.currenttemp = 40.0
+    simtime["t"] += 1
+    program.applyProgram()
+    simtime["t"] += 60 + 1
+    program.applyProgram()
+    assert program.currentstage == 2
+    assert controller.SP == 38.0
+    assert ("cons", 5.0, 0.01, 0.0) in controller.pidcalls, \
+        "stage 2's own profile must be applied on transition"
+    print("OK - per-stage PID profiles apply on stage transitions, falling back when unset")
+
+
+def test_fast_approach_skips_the_ramp():
+    """A stage with fast_approach=True must send the full target setpoint
+    immediately (letting the firmware's aggressive full-power profile drive
+    the whole climb), never engaging the gentle ramp even once inside its
+    rampzone - the opposite of the default (gentle) stage, which must still
+    ramp exactly as before."""
+    controller = FakeController(SimulatedMCUPID())
+    stages = [{"temperature": 82.0, "duration_minutes": 1.0, "fast_approach": True},
+              {"temperature": 40.0, "duration_minutes": 1.0}]  # default: gentle
+    program = PIDProgram(controller, stages=stages, tunings=(20.0, 0.02, 0.4),
+                         timesource=lambda: 0.0, rampzone=10.0, ramprate=0.5 / 60.0)
+
+    # Well inside the 10 C rampzone - a gentle stage would cap SP near temp,
+    # but fast_approach must send the full target directly regardless.
+    controller.currenttemp = 75.0
+    program.updateapproachramp()
+    assert controller.SP == 82.0, "fast_approach stage must not be capped by the ramp"
+    assert program.rampstart is None, "fast_approach stage must never start a ramp"
+
+    # Advance to stage 1 (gentle): the ramp must engage normally, exactly as
+    # it did before fast_approach existed.
+    controller.currenttemp = 82.0
+    program.applyProgram()
+    program.startnextsteptime = 0.0  # force the hold to be "over"
+    program.applyProgram()
+    assert program.currentstage == 1
+    assert controller.SP == 40.0, "the new stage's target must be sent on transition"
+
+    controller.currenttemp = 45.0  # already above target
+    program.updateapproachramp()
+    assert program.rampstart is None, "approaching from above must not ramp (no active cooling)"
+    assert controller.SP == 40.0
+
+    controller.currenttemp = 32.0  # 8 C below target, inside the rampzone, approaching from below
+    program.rampstart = None
+    program.updateapproachramp()
+    assert program.rampstart is not None, "a gentle (non-fast_approach) stage must still ramp"
+    assert controller.SP < 40.0, "the gentle stage's SP must be capped below target by the ramp"
+    print("OK - fast_approach skips the ramp for that stage only, gentle stages ramp as before")
+
+
 def test_progress_reporting():
     controller = FakeController(SimulatedMCUPID())
     simtime = {"t": 0.0}
@@ -183,5 +269,7 @@ def test_progress_reporting():
 if __name__ == '__main__':
     test_settingsstore()
     test_greek_yogurt_program()
+    test_per_stage_pid_profiles()
+    test_fast_approach_skips_the_ramp()
     test_progress_reporting()
     print("\nOK - all settings/program tests passed.")

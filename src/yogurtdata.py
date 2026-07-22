@@ -18,6 +18,14 @@ from src.RelayAutotune import RelayAutotune
 from src.NetworkConfiguration import NetworkConfiguration
 
 
+def formatpid(value):
+    """Kp/Ki/Kd values often come from autotune/the optimizer with a dozen+
+    decimal digits of floating-point noise - 5 decimal digits is already
+    far more precision than the tuning process or the firmware's own
+    resolution can use."""
+    return str(round(float(value), 5))
+
+
 class SingleInstanceError(Exception):
     pass
 
@@ -58,7 +66,7 @@ def acquireportlock(port):
 
 
 class YogourtFermenter():
-    def __init__(self, mode=None, stages=None, tunings=None,
+    def __init__(self, mode=None, stages=None, tunings=None, stagetunings=None,
                  autotunetarget=None, autotunesafetymargin=12.0, onautotunedone=None,
                  ontick=None, autorun=True, showgraph=True):
         modes = ['pidprogram','relayautotune']
@@ -123,13 +131,17 @@ class YogourtFermenter():
         # GUI's "Start optimizer" button. Runs alongside pidprogram mode,
         # never replaces it - it only nudges the cons Kp/Ki/Kd over time.
         self.pidoptimizer = None
+        # Per-second-task pacing for the control loop; shared by the blocking
+        # listeningloop() and the PyQt GUI's timer-driven steponce() calls.
+        self._loop_lastsec = None
+        self._loopcount = 0
         self.setPidvalues()
         self.networkconf = NetworkConfiguration()
         self.portlock = acquireportlock(self.networkconf.listen_port)
         self.createsocket()
         self.creategraph()
         if self.mode == 'pidprogram':
-            self.pidprogram = PIDProgram(self, stages=stages, tunings=tunings)
+            self.pidprogram = PIDProgram(self, stages=stages, tunings=tunings, stagetunings=stagetunings)
         if self.mode == 'relayautotune':
             if autotunetarget is None:
                 autotunetarget = float(os.environ.get('YOGURT_AUTOTUNE_TARGET', self.SP))
@@ -227,8 +239,24 @@ class YogourtFermenter():
             return
         self.lastgraphrecreate = time.time()
         style.use('fivethirtyeight')
+        # HiDPI/4K support, matching YogurtGUIQt's YOGURT_UI_FONT_PT: bump
+        # every font on the figure and scale the figure size by the same
+        # ratio, since matplotlib's default ~9pt reads just as tiny on a 4K
+        # screen as Tk's/Qt's own defaults do.
+        fontpt = float(os.environ.get('YOGURT_UI_FONT_PT', 16))
+        uiscale = fontpt / 9.0
+        plt.rcParams.update({
+            'font.size': fontpt,
+            'axes.titlesize': fontpt * 1.05,
+            'axes.labelsize': fontpt,
+            'legend.fontsize': fontpt * 0.85,
+            'xtick.labelsize': fontpt * 0.85,
+            'ytick.labelsize': fontpt * 0.85,
+            'lines.linewidth': 2.0,
+        })
 
-        self.fig , ((self.ax1, self.ax2),(self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(10, 5))
+        self.fig , ((self.ax1, self.ax2),(self.ax3, self.ax4)) = plt.subplots(
+            2, 2, figsize=(10 * uiscale, 5 * uiscale))
         self.fig.subplots_adjust(hspace=0.6, wspace=0.3)
         plt.ion()
 
@@ -238,7 +266,7 @@ class YogourtFermenter():
         self.ax2.xaxis.set_major_formatter(xfmt)
         self.ax3.xaxis.set_major_formatter(xfmt2)
         self.ax4.xaxis.set_major_formatter(xfmt)
-        self.ax2.set_title("P="+str(self.currentPIDSettings[0])+"I="+str(self.currentPIDSettings[1])+"D="+str(self.currentPIDSettings[2]))
+        self.ax2.set_title("P="+formatpid(self.currentPIDSettings[0])+" I="+formatpid(self.currentPIDSettings[1])+" D="+formatpid(self.currentPIDSettings[2]))
         self.ax1.plot([], [],label="Temp")
         self.ax1.plot([], [],label="PID")
         self.ax2.plot([], [],label="P")
@@ -246,6 +274,13 @@ class YogourtFermenter():
         self.ax2.plot([], [],label="D")
         self.ax3.plot([], [],label="Latest Temp")
         self.ax4.plot([], [], label="Temperature last change")
+        # Setpoint reference line, on both the long-term and short-term
+        # (zoom) temperature graphs. axhline()'s Line2D uses a blended
+        # transform (x in axes-relative space, y in data space), which
+        # matplotlib's relim()/autoscale_view() ignore - it never distorts
+        # the temperature axis' auto-scaling, only the two .plot() lines do.
+        self.spline1 = self.ax1.axhline(self.SP, color='gray', linestyle='--', linewidth=1, label='Target')
+        self.spline3 = self.ax3.axhline(self.SP, color='gray', linestyle='--', linewidth=1)
         self.ax1.legend()
         self.ax2.legend()
         self.fig.show()  # show the window (figure will be in foreground, but the user may move it to background)
@@ -329,18 +364,20 @@ class YogourtFermenter():
             self.ax1.lines[1].set_data(x, self.CV[:n])  # PID PWM
             self.ax1.lines[0].set_zorder(2)
             self.ax1.set_title("MCU target="+str(self.currentSP))
+            self.spline1.set_ydata([self.currentSP, self.currentSP])
 
 
             self.ax2.lines[0].set_data(x, [i[0] for i in self.PIDTermslist[:n]])
             self.ax2.lines[1].set_data(x, [i[1] for i in self.PIDTermslist[:n]])
             self.ax2.lines[2].set_data(x, [i[2] for i in self.PIDTermslist[:n]])
-            self.ax2.set_title("P="+str(self.currentPIDSettings[0])+"I="+str(self.currentPIDSettings[1])+"D="+str(self.currentPIDSettings[2]))
+            self.ax2.set_title("P="+formatpid(self.currentPIDSettings[0])+" I="+formatpid(self.currentPIDSettings[1])+" D="+formatpid(self.currentPIDSettings[2]))
 
             if n>100:
                 self.ax3.lines[0].set_data(x[-100:], self.tempbysec[n-100:n])  # Temperature
             else:
                 self.ax3.lines[0].set_data(x, self.tempbysec[:n])  # Temperature
             self.ax3.set_title("Current temp=" + str(self.currenttemp))
+            self.spline3.set_ydata([self.currentSP, self.currentSP])
             self.ax4.lines[0].set_data([i[0] for i in self.errorlist], [i[1] for i in self.errorlist])
 
             self.ax1.set_title("MCU target=" + str(self.currentSP))
@@ -544,63 +581,130 @@ class YogourtFermenter():
                 self.currentPIDTerms = answers
             return
     def listeningloop(self):
-        lastsec = int(time.time())
-        print(lastsec)
-        count = 0
-        while not self.stoprequested:
-            if time.time() > lastsec + 1:
-                lastsec = int(time.time())
-                self.tempbysec.append(self.currenttemp)
-                self.CV.append(self.currentCV)
-                self.SPlist.append(self.currentSP)
-                self.PIDTermslist.append(self.currentPIDTerms)
-                self.cleanPlotlists()
-                self.animate()
-                self.safecall("checkconnection", self.checkconnection)
-                if self.mode == 'relayautotune':
-                    self.safecall("relayautotune.update", self.relayautotune.update, self.currenttemp)
-                if self.pidoptimizer is not None:
-                    self.safecall("pidoptimizer.update", self.pidoptimizer.update, self.currenttemp)
-                count += 1
-                if count > 5:
-                    count = 0
-                    self.savetempbysectocsv()
-            if self.mode == 'pidprogram':
-                self.safecall("pidprogram.applyProgram", self.pidprogram.applyProgram)
-            if self.ontick is not None:
-                if self.safecall("ontick", self.ontick):
-                    self.ontickfailures = 0
-                else:
-                    self.ontickfailures += 1
-                    if self.ontickfailures >= 10:
-                        print("ontick() failed 10 times in a row - assuming the GUI is gone, stopping.")
-                        self.diaglog("ONTICK_GIVING_UP after 10 consecutive failures")
-                        self.stoprequested = True
+        """Blocking control loop for callers that own no event loop of their
+        own: the headless CLI and the Tkinter GUI (whose ontick() pumps
+        Tk via root.update()). It blocks here until stoprequested, driving
+        one steponce() per iteration.
 
+        The PyQt GUI does NOT use this - it keeps Qt's own event loop
+        (app.exec_) running and calls steponce(blocking=False,
+        runontick=False) from a QTimer instead. Blocking here and
+        hand-cranking repaints through QApplication.processEvents() is what
+        silently wedged that window on multi-day runs: a py-spy dump of a
+        frozen instance showed the main thread parked in this method's
+        recvfrom() with Qt's real event loop suspended behind it, so the
+        window stopped repainting while the control loop itself kept
+        cycling. Driving the loop from a QTimer lets Qt paint natively."""
+        self._loop_lastsec = int(time.time())
+        self._loopcount = 0
+        print(self._loop_lastsec)
+        while not self.stoprequested:
+            self.steponce(blocking=True, runontick=True)
+        self.closelistening()
+        print("Listening loop stopped.")
+
+    def steponce(self, blocking=True, runontick=True):
+        """One iteration of the control loop. blocking=True does the
+        original timeout-bounded recvfrom (headless/Tkinter). blocking=False
+        drains whatever packets are already waiting without blocking, for a
+        caller that drives this from its own event loop's timer (the PyQt
+        GUI); there Qt paints natively, so runontick=False as well - the
+        per-iteration ontick/processEvents pump is neither needed nor
+        wanted."""
+        if self._loop_lastsec is None:
+            self._loop_lastsec = int(time.time())
+        if time.time() > self._loop_lastsec + 1:
+            self._loop_lastsec = int(time.time())
+            self.persecondtasks()
+        if self.mode == 'pidprogram':
+            self.safecall("pidprogram.applyProgram", self.pidprogram.applyProgram)
+        if runontick and self.ontick is not None:
+            if self.safecall("ontick", self.ontick):
+                self.ontickfailures = 0
+            else:
+                self.ontickfailures += 1
+                if self.ontickfailures >= 10:
+                    print("ontick() failed 10 times in a row - assuming the GUI is gone, stopping.")
+                    self.diaglog("ONTICK_GIVING_UP after 10 consecutive failures")
+                    self.stoprequested = True
+        if blocking:
+            self.receiveone()
+        else:
+            self.drainincoming()
+
+    def persecondtasks(self):
+        self.tempbysec.append(self.currenttemp)
+        self.CV.append(self.currentCV)
+        self.SPlist.append(self.currentSP)
+        self.PIDTermslist.append(self.currentPIDTerms)
+        self.cleanPlotlists()
+        self.animate()
+        self.safecall("checkconnection", self.checkconnection)
+        if self.mode == 'relayautotune':
+            self.safecall("relayautotune.update", self.relayautotune.update, self.currenttemp)
+        if self.pidoptimizer is not None:
+            self.safecall("pidoptimizer.update", self.pidoptimizer.update, self.currenttemp)
+        self._loopcount += 1
+        if self._loopcount > 5:
+            self._loopcount = 0
+            self.savetempbysectocsv()
+
+    def receiveone(self):
+        """Read and handle one UDP packet. Returns True if one was
+        processed, False if none was available (socket timeout, or a
+        would-block on a non-blocking socket). Recreates the socket on a
+        genuine error."""
+        try:
+            data, address = self.sock.recvfrom(4096)
+        except (BlockingIOError, socket.timeout):
+            return False
+        except OSError as e:
+            print("Socket error:", e)
+            self.createsocket()
+            return False
+        self.lastpackettime = time.time()
+        try:
+            message = data.decode()
+        except UnicodeDecodeError:
+            print("Ignoring undecodable packet:", data[:80])
+            return True
+        print(message)
+        try:
+            self.handlemessage(message)
+        except (ValueError, IndexError) as e:
+            # A truncated or corrupted UDP packet must never crash the
+            # program (this used to kill the graph).
+            print("Ignoring malformed message", repr(message), ":", e)
+        return True
+
+    def drainincoming(self, maxpackets=200):
+        """Process every UDP packet already waiting, without blocking, then
+        return - so a caller driving this from its own event loop's timer
+        stays responsive. maxpackets bounds a single call in case the ESP
+        floods faster than we drain."""
+        sock = self.sock
+        prev = sock.gettimeout()
+        try:
+            sock.settimeout(0.0)  # non-blocking for the drain
+        except OSError:
+            pass
+        try:
+            for _ in range(maxpackets):
+                if not self.receiveone():
+                    break
+        finally:
+            # self.sock may have been replaced by createsocket() on error;
+            # restore the timeout on whatever the current socket is.
             try:
-                data, address = self.sock.recvfrom(4096)
-            except socket.timeout:
-                # No data this second: loop again so the graph stays alive.
-                continue
-            except OSError as e:
-                print("Socket error:", e)
-                self.createsocket()
-                continue
-            self.lastpackettime = time.time()
-            try:
-                message = data.decode()
-            except UnicodeDecodeError:
-                print("Ignoring undecodable packet:", data[:80])
-                continue
-            print(message)
-            try:
-                self.handlemessage(message)
-            except (ValueError, IndexError) as e:
-                # A truncated or corrupted UDP packet must never crash the
-                # program (this used to kill the graph).
-                print("Ignoring malformed message", repr(message), ":", e)
-        # Loop stopped (GUI stop button or shutdown): release the port so a
-        # new run can bind it.
+                self.sock.settimeout(prev if prev is not None else 0.2)
+            except OSError:
+                pass
+
+    def closelistening(self):
+        """Release the socket, the single-instance port lock, and (for the
+        matplotlib GUI) the figure. Called once when the loop stops - from
+        listeningloop() for blocking callers, or by the PyQt GUI when it
+        stops its pump timer."""
         try:
             self.sock.close()
         except OSError:
@@ -623,7 +727,6 @@ class YogourtFermenter():
                 plt.close(self.fig)
             except Exception:
                 pass
-        print("Listening loop stopped.")
 
 
 if __name__ == '__main__':

@@ -1,8 +1,40 @@
-This program is intended to be used in conjunction with this codebase :
-https://github.com/Carlsans/ESP8266RemotePIDController
-You need to setup your mcu first and then run the python program to access your mcu.
-They both talk to each other through web serial.
-Run yogurtdata.py
+# Yogurt Fermenter
+
+A PID-controlled yogurt fermenter: a Python control panel that talks over UDP
+to an [ESP8266 running a PID controller](https://github.com/Carlsans/ESP8266RemotePIDController)
+wired to a heating element and a thermocouple in your pot. Set up a staged
+temperature program (e.g. heat to 82 C to sanitize the milk, then hold at
+40 C for the ferment), pick a PID profile, and let it run - with live
+graphs, autotuning, and per-stage tunings.
+
+![Qt GUI running a live ferment](images/qt-gui-running.png)
+*The Qt control panel mid-run: staged program on the left, live
+temperature/output/staleness graphs on the right.*
+
+## Contents
+
+- [Getting started](#getting-started)
+- [GUI](#gui)
+- [Only one instance at a time](#only-one-instance-at-a-time)
+- [Modes](#modes)
+- [Configuration environment variables](#configuration-environment-variables)
+- [Tests](#tests)
+- [Troubleshooting: diagnosing a frozen graph](#diagnosing-a-frozen-graph)
+
+## Getting started
+
+1. **Build and flash the MCU side first**: follow the setup instructions at
+   [ESP8266RemotePIDController](https://github.com/Carlsans/ESP8266RemotePIDController).
+   The Python program and the ESP8266 talk to each other over UDP ("web
+   serial" between the two), so the ESP needs to be flashed and on your
+   network before the GUI is useful.
+2. **Install Python dependencies** (matplotlib, PyQt5, pyqtgraph, etc. -
+   see the GUI section below for which GUI needs what).
+3. **Point the program at your ESP**: by default it looks for the ESP at
+   `192.168.0.4:5000` (see [Configuration environment variables](#configuration-environment-variables)
+   to change it).
+4. **Run a GUI** (see [GUI](#gui) below) and build a staged program, or run
+   `src/yogurtdata.py` directly for a headless run.
 
 ## GUI
 
@@ -13,7 +45,7 @@ Two control panels exist with the same feature set; pick one:
 - **PyQt5 + pyqtgraph** (`src/YogurtGUIQt.py`) - a faster-drawing graph and a
   single GUI toolkit end to end (the Tkinter version's graph runs through
   matplotlib's own window management, which is a second, independent Tk
-  interpreter in the same process - see "Diagnosing a frozen graph" below).
+  interpreter in the same process - see [Diagnosing a frozen graph](#diagnosing-a-frozen-graph)).
   Needs `pyqtgraph` (`./venvarch/bin/python -m pip install pyqtgraph`; PyQt5
   itself is already a dependency of matplotlib's Qt backend).
 
@@ -28,8 +60,9 @@ On a Wayland desktop (e.g. niri) the normal venv's PyQt5 has no Wayland
 platform plugin, so `src.YogurtGUIQt` runs through **XWayland** - which on
 this setup (niri + `xwayland-satellite`) stops presenting the window when it
 is left off a visible workspace or on an idle-blanked output, so the window
-"freezes" while the process stays perfectly healthy (see "long-run freeze,
-part 3" below). Run it as a **native Wayland** client instead:
+"freezes" while the process stays perfectly healthy (see
+[part 3 of the long-run freeze writeup](#the-qt-guis-long-run-freeze-part-3-xwayland-presentation-mitigated)
+below). Run it as a **native Wayland** client instead:
 
     ./run_gui_wayland.sh
 
@@ -59,6 +92,8 @@ GUI's graph also got a visual pass: a dark theme, a distinguishable color
 per line, a filled temperature curve, a dashed setpoint reference line, and
 a second Y axis for Output so it no longer fights the temperature curve's
 scale.
+
+### Features
 
 - **Program stages**: add/remove stages (heat to a temperature, then hold it for a
   duration). Example for Greek yogurt: 82 C held 10 min (texture + sanitizing),
@@ -108,7 +143,7 @@ scale.
   setpoint (the MCU is autonomous); "Stop & heater off" sends SetSP(1) first.
 - **Refresh graph**: requests the graph window be closed and reopened; the
   actual work happens on the next tick from a safe context, not synchronously
-  from the button click (see "Only one instance at a time" below for why).
+  from the button click (see [Only one instance at a time](#only-one-instance-at-a-time) for why).
   Automatic periodic refresh is off by default (see
   `YOGURT_GRAPH_REFRESH_SECONDS` below) since it raises/refocuses the window,
   which is disruptive on its own.
@@ -124,7 +159,7 @@ packet to only one of them at a time - one process kept controlling the pot
 normally while the other sat frozen on stale data, and both were sending
 their own `SetSP`/`SetTunings` commands to the real ESP the whole time. This
 went unnoticed because neither process actually crashed; a window that looks
-frozen (see "Diagnosing a frozen graph" below) is not the same as a dead
+frozen (see [Diagnosing a frozen graph](#diagnosing-a-frozen-graph)) is not the same as a dead
 process, and starting a fresh instance without confirming the old one is
 really gone leaves it running in the background indefinitely.
 
@@ -177,127 +212,6 @@ Example:
 - `YOGURT_GRAPH_DIAG_SLOW_MS` - a single redraw call taking longer than this
   is logged immediately (default `250`)
 
-## Diagnosing a frozen graph
-
-Every run writes `graph_diagnostics.log`: a `GRAPH_CREATED` line at startup
-and after every proactive refresh (with the matplotlib backend and Qt
-platform in use), a `HEARTBEAT` line every 5 minutes (temperature, setpoint,
-redraw count/timing, point count, `fig_stale`), and an immediate
-`SLOW_REDRAW` line if any single redraw call takes more than 250 ms. This
-distinguishes two very different failure modes: a slow/hung redraw *call*
-(a real Python-level problem, would show as `SLOW_REDRAW` or a gap in
-heartbeats) versus the window silently no longer being repainted on screen
-while Python sees nothing wrong (no anomaly in the log at all - the redraw
-calls keep returning normally and quickly, they just aren't reaching the
-screen). If the graph looks frozen during a run, **note the wall-clock time**
-and check the log afterwards: heartbeats with fast, steady `max_redraw_ms`
-around that time mean the freeze was invisible to the process (a
-window-manager/compositor-side issue - the proactive refresh should recover
-it within `YOGURT_GRAPH_REFRESH_SECONDS`), while a gap in heartbeats or a
-`SLOW_REDRAW`/exception would point at a real in-process hang instead.
-
-### The Qt GUI's long-run freeze (fixed)
-
-A third failure mode, found the hard way on a real multi-hour run of the Qt
-GUI: neither a hung redraw call nor a compositor problem, but the redraw
-being *legitimately* slow enough to starve the event loop. `updateplots()`
-redraws every curve once a second over the **whole** run history, so its
-cost grew with run length - measured at this window size, a full
-update+render took ~0.15 s at 1 h of data but ~4.2 s at the 20 h cap
-(`cleanPlotlists()`). Once one redraw takes longer than the one-second
-redraw interval, the loop does nothing but paint and the window stops
-responding to input - indistinguishable from a crash from the outside,
-which is exactly how it was first reported.
-
-Two causes, both needed fixing (measured with `tests/test_gui_qt.py`'s
-`test_plot_redraw_stays_fast_on_long_runs`, and end-to-end via event-loop
-lag against a fake ESP - median lag went from **2580 ms to 1 ms**):
-
-- **No downsampling**: every one of ~72 000 points was handed to Qt to
-  stroke, most landing on the same screen pixel. Now
-  `setDownsampling(auto=True, method='peak')` + `setClipToView(True)`: the
-  min/max envelope per pixel is kept (spikes stay visible) and off-screen
-  points are skipped.
-- **Antialiasing on wide pens**: Qt's raster engine has no fast path for
-  antialiased pens wider than 1 px - ~40 ms per dense curve per redraw,
-  across 7 curves. Antialiasing is now off globally for the graph; the
-  100-point zoom curve opts back in (`antialias=True`), where it costs
-  nothing and the smoothing is actually visible.
-
-`updateplots()` also logs a `QT_SLOW_PLOT` line to the diagnostics log if it
-ever exceeds 250 ms again, so a future regression leaves evidence instead of
-just looking like another mystery freeze.
-
-### The Qt GUI's long-run freeze, part 2: the blocking event loop (fixed)
-
-The redraw fix above was necessary but not sufficient - the window still
-froze on a multi-day run. This time a `py-spy dump` of the live frozen
-instance was decisive: the main thread was parked in
-`listeningloop()`'s `recvfrom()`, with Qt's real event loop (`app.exec_`)
-suspended on the stack behind it. The Qt GUI had inherited the Tkinter
-design where the fermenter *blocks* in `listeningloop()` and the GUI is
-repainted only by `QApplication.processEvents()` calls hand-cranked from
-inside that loop (once per socket read). That manual pump is fragile over
-long runs: the window silently stops repainting while the control loop
-keeps cycling, so from outside it looks like a crash even though the
-process is healthy and low-CPU (~10%, mostly asleep in `poll` - nothing
-like the CPU-pegged redraw-starvation above).
-
-The fix is architectural: the Qt GUI no longer blocks. `runfermenter()`
-creates the fermenter with `autorun=False`, then drives it from a `QTimer`
-(`_pumpfermenter`, 10 Hz) while Qt's own `app.exec_()` stays in charge of
-painting the normal, robust way. `listeningloop()` was factored into
-`steponce()` / `receiveone()` / `drainincoming()` / `closelistening()` so
-the blocking version still serves the Tkinter GUI and headless mode
-unchanged, while the Qt pump calls `steponce(blocking=False,
-runontick=False)` and lets Qt paint natively. Because the pump is timer-
-driven, the window now stays responsive **regardless of packet arrival** -
-verified on a real display with 20 h of history while the fake ESP goes
-silent mid-run (event-loop lag stayed at ~0 ms median). Regression test:
-`test_event_loop_stays_responsive_while_running`. The pump also writes a
-`QT_PUMP_HEARTBEAT` line to the diagnostics log every 60 s, so if the
-window ever freezes again the log immediately distinguishes "timer still
-firing" (a genuine compositor/WM-side freeze) from "pump wedged".
-
-### The Qt GUI's long-run freeze, part 3: XWayland presentation (mitigated)
-
-Even after part 2 the window still froze after a couple of hours - and this
-time the `QT_PUMP_HEARTBEAT` line the part-2 fix added settled it
-immediately: on the live frozen instance the heartbeats were **still being
-written every 60 s** (temperature and point-count advancing normally), and a
-`py-spy dump` showed the main thread idle in Qt's event loop. So the process
-and the whole control loop were completely healthy - only the on-screen
-window was frozen. This is the "compositor silently stops redrawing a
-long-lived window" mode the matplotlib GUI already guards against with
-`recreategraph` (see above); the Qt GUI just never had an equivalent.
-
-The environment is the reason: the desktop is **niri** (a Wayland
-compositor) and the venv's bundled Qt has no native Wayland platform plugin
-(only `xcb`), so the GUI runs through **XWayland**, provided by
-**`xwayland-satellite`**. When the window is somewhere the compositor stops
-compositing it (a non-visible niri workspace, or an idle-blanked output),
-frame callbacks stop and the surface can stop presenting new frames and fail
-to resume when shown again. It is not reproducible on a short timescale
-(monitor DPMS-off, and a nested-niri window hidden for 15 s, both recovered
-fine); it takes hours, so it could not be validated by fast reproduction.
-
-Mitigation (`_forcerepaint`, `YOGURT_QT_REPAINT_SECONDS`, default 2 s): a
-watchdog `QTimer` calls `self.plotwidget.viewport().repaint()` - a
-*synchronous* repaint that does not wait for a frame callback, so the app
-commits a fresh buffer every couple of seconds regardless. For the window to
-stay frozen the compositor would have to ignore our commits outright, not
-merely withhold frame-callback requests (the common XWayland-stall cause).
-It runs cleanly through the real XWayland path (verified in a nested niri +
-xwayland-satellite) and costs one extra plot repaint every 2 s.
-
-The **definitive** fix is to not go through XWayland at all: run the GUI on
-a Qt that has the Wayland platform plugin. `./run_gui_wayland.sh` does this
-(system Qt via `venvwayland`, forced `QT_QPA_PLATFORM=wayland` - see
-"Running the Qt GUI natively on Wayland" above); a native Wayland window is
-not subject to the XWayland presentation stall at all. A newer
-`xwayland-satellite` may also fix it. The repaint watchdog stays as the
-in-app best effort for anyone still running through XWayland.
-
 ## Tests
 
 Automated tests run against a simulated pot / fake ESP on localhost and never touch
@@ -337,3 +251,136 @@ cuts its output - no tuning can see it. PIDProgram therefore ramps the setpoint
 over the last 10 C of any upward approach (0.5 C/min, never leading the
 measured temperature by more than ~2 C), which lets the stored heat arrive
 during the approach instead of after it.
+
+## Diagnosing a frozen graph
+
+Every run writes `graph_diagnostics.log`: a `GRAPH_CREATED` line at startup
+and after every proactive refresh (with the matplotlib backend and Qt
+platform in use), a `HEARTBEAT` line every 5 minutes (temperature, setpoint,
+redraw count/timing, point count, `fig_stale`), and an immediate
+`SLOW_REDRAW` line if any single redraw call takes more than 250 ms. This
+distinguishes two very different failure modes: a slow/hung redraw *call*
+(a real Python-level problem, would show as `SLOW_REDRAW` or a gap in
+heartbeats) versus the window silently no longer being repainted on screen
+while Python sees nothing wrong (no anomaly in the log at all - the redraw
+calls keep returning normally and quickly, they just aren't reaching the
+screen). If the graph looks frozen during a run, **note the wall-clock time**
+and check the log afterwards: heartbeats with fast, steady `max_redraw_ms`
+around that time mean the freeze was invisible to the process (a
+window-manager/compositor-side issue - the proactive refresh should recover
+it within `YOGURT_GRAPH_REFRESH_SECONDS`), while a gap in heartbeats or a
+`SLOW_REDRAW`/exception would point at a real in-process hang instead.
+
+The sections below are postmortems of three real long-run freezes on the Qt
+GUI, kept for reference in case a similar symptom shows up again.
+
+<details>
+<summary><strong>The Qt GUI's long-run freeze (fixed)</strong></summary>
+
+A third failure mode, found the hard way on a real multi-hour run of the Qt
+GUI: neither a hung redraw call nor a compositor problem, but the redraw
+being *legitimately* slow enough to starve the event loop. `updateplots()`
+redraws every curve once a second over the **whole** run history, so its
+cost grew with run length - measured at this window size, a full
+update+render took ~0.15 s at 1 h of data but ~4.2 s at the 20 h cap
+(`cleanPlotlists()`). Once one redraw takes longer than the one-second
+redraw interval, the loop does nothing but paint and the window stops
+responding to input - indistinguishable from a crash from the outside,
+which is exactly how it was first reported.
+
+Two causes, both needed fixing (measured with `tests/test_gui_qt.py`'s
+`test_plot_redraw_stays_fast_on_long_runs`, and end-to-end via event-loop
+lag against a fake ESP - median lag went from **2580 ms to 1 ms**):
+
+- **No downsampling**: every one of ~72 000 points was handed to Qt to
+  stroke, most landing on the same screen pixel. Now
+  `setDownsampling(auto=True, method='peak')` + `setClipToView(True)`: the
+  min/max envelope per pixel is kept (spikes stay visible) and off-screen
+  points are skipped.
+- **Antialiasing on wide pens**: Qt's raster engine has no fast path for
+  antialiased pens wider than 1 px - ~40 ms per dense curve per redraw,
+  across 7 curves. Antialiasing is now off globally for the graph; the
+  100-point zoom curve opts back in (`antialias=True`), where it costs
+  nothing and the smoothing is actually visible.
+
+`updateplots()` also logs a `QT_SLOW_PLOT` line to the diagnostics log if it
+ever exceeds 250 ms again, so a future regression leaves evidence instead of
+just looking like another mystery freeze.
+
+</details>
+
+<details>
+<summary><strong>The Qt GUI's long-run freeze, part 2: the blocking event loop (fixed)</strong></summary>
+
+The redraw fix above was necessary but not sufficient - the window still
+froze on a multi-day run. This time a `py-spy dump` of the live frozen
+instance was decisive: the main thread was parked in
+`listeningloop()`'s `recvfrom()`, with Qt's real event loop (`app.exec_`)
+suspended on the stack behind it. The Qt GUI had inherited the Tkinter
+design where the fermenter *blocks* in `listeningloop()` and the GUI is
+repainted only by `QApplication.processEvents()` calls hand-cranked from
+inside that loop (once per socket read). That manual pump is fragile over
+long runs: the window silently stops repainting while the control loop
+keeps cycling, so from outside it looks like a crash even though the
+process is healthy and low-CPU (~10%, mostly asleep in `poll` - nothing
+like the CPU-pegged redraw-starvation above).
+
+The fix is architectural: the Qt GUI no longer blocks. `runfermenter()`
+creates the fermenter with `autorun=False`, then drives it from a `QTimer`
+(`_pumpfermenter`, 10 Hz) while Qt's own `app.exec_()` stays in charge of
+painting the normal, robust way. `listeningloop()` was factored into
+`steponce()` / `receiveone()` / `drainincoming()` / `closelistening()` so
+the blocking version still serves the Tkinter GUI and headless mode
+unchanged, while the Qt pump calls `steponce(blocking=False,
+runontick=False)` and lets Qt paint natively. Because the pump is timer-
+driven, the window now stays responsive **regardless of packet arrival** -
+verified on a real display with 20 h of history while the fake ESP goes
+silent mid-run (event-loop lag stayed at ~0 ms median). Regression test:
+`test_event_loop_stays_responsive_while_running`. The pump also writes a
+`QT_PUMP_HEARTBEAT` line to the diagnostics log every 60 s, so if the
+window ever freezes again the log immediately distinguishes "timer still
+firing" (a genuine compositor/WM-side freeze) from "pump wedged".
+
+</details>
+
+<details>
+<summary><strong>The Qt GUI's long-run freeze, part 3: XWayland presentation (mitigated)</strong></summary>
+
+Even after part 2 the window still froze after a couple of hours - and this
+time the `QT_PUMP_HEARTBEAT` line the part-2 fix added settled it
+immediately: on the live frozen instance the heartbeats were **still being
+written every 60 s** (temperature and point-count advancing normally), and a
+`py-spy dump` showed the main thread idle in Qt's event loop. So the process
+and the whole control loop were completely healthy - only the on-screen
+window was frozen. This is the "compositor silently stops redrawing a
+long-lived window" mode the matplotlib GUI already guards against with
+`recreategraph` (see above); the Qt GUI just never had an equivalent.
+
+The environment is the reason: the desktop is **niri** (a Wayland
+compositor) and the venv's bundled Qt has no native Wayland platform plugin
+(only `xcb`), so the GUI runs through **XWayland**, provided by
+**`xwayland-satellite`**. When the window is somewhere the compositor stops
+compositing it (a non-visible niri workspace, or an idle-blanked output),
+frame callbacks stop and the surface can stop presenting new frames and fail
+to resume when shown again. It is not reproducible on a short timescale
+(monitor DPMS-off, and a nested-niri window hidden for 15 s, both recovered
+fine); it takes hours, so it could not be validated by fast reproduction.
+
+Mitigation (`_forcerepaint`, `YOGURT_QT_REPAINT_SECONDS`, default 2 s): a
+watchdog `QTimer` calls `self.plotwidget.viewport().repaint()` - a
+*synchronous* repaint that does not wait for a frame callback, so the app
+commits a fresh buffer every couple of seconds regardless. For the window to
+stay frozen the compositor would have to ignore our commits outright, not
+merely withhold frame-callback requests (the common XWayland-stall cause).
+It runs cleanly through the real XWayland path (verified in a nested niri +
+xwayland-satellite) and costs one extra plot repaint every 2 s.
+
+The **definitive** fix is to not go through XWayland at all: run the GUI on
+a Qt that has the Wayland platform plugin. `./run_gui_wayland.sh` does this
+(system Qt via `venvwayland`, forced `QT_QPA_PLATFORM=wayland` - see
+"Running the Qt GUI natively on Wayland" above); a native Wayland window is
+not subject to the XWayland presentation stall at all. A newer
+`xwayland-satellite` may also fix it. The repaint watchdog stays as the
+in-app best effort for anyone still running through XWayland.
+
+</details>

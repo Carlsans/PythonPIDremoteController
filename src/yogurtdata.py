@@ -625,7 +625,7 @@ class YogourtFermenter():
             self.errorlist = self.errorlist[60*60:]
     def checkconnection(self):
         if time.time() - self.lastpackettime > self.connectionlostseconds:
-            msg = ("WARNING: no packet received for " + str(self.connectionlostseconds) + "s from "
+            msg = ("WARNING: No packet received for " + str(self.connectionlostseconds) + "s from "
                    + self.networkconf.esp8266_ip + ":" + str(self.networkconf.esp8266_port)
                    + ". Resetting UDP connection and re-requesting the setpoint.")
             if self.currenttemp <= 0:

@@ -30,7 +30,7 @@ class PIDProgram:
     """
     def __init__(self,controller, stages=None, tunings=None, stagetunings=None, timesource=time.time,
                  approachtunings=(100.0, 0.0, 0.0),
-                 ramprate=0.5 / 60.0, rampzone=10.0):
+                 ramprate=0.5 / 60.0, rampzone=10.0, aggressiveband=5.0):
         self.controller = controller
         self.now = timesource
         self.programstarttime = self.now()
@@ -45,6 +45,23 @@ class PIDProgram:
         # what caused massive overshoot when heating to a low setpoint like
         # 38 C, where the pot barely cools passively. (Setting both profiles
         # to the same PI, as setAllPID did, defeats this firmware feature.)
+        #
+        # That firmware switch is symmetric though - it keys off |SP - temp|,
+        # so an overshoot past target by more than the same ~4.5 C also
+        # lands on the bare Kp=100/Ki=0 profile, not just an undershoot.
+        # Harmless in itself (Kp=100 on a positive error just clamps output
+        # to 0), but pointless: there is no climb to protect once at/over
+        # target, and the moment the gap closes back under 4.5 C, cons takes
+        # over with a cold integral that never saw the overshoot. See
+        # updateaggressiveprofile(): once within `aggressiveband` of target
+        # or above it, this keeps the agg slot mirroring cons so which slot
+        # the firmware happens to pick no longer matters - the true
+        # Kp=100 approach profile only ever loads while genuinely still
+        # climbing from well below.
+        self.approachtunings = approachtunings
+        self.aggressiveband = aggressiveband
+        self._aggmode = 'aggressive'
+        self._aggmatched = None
         self.controller.setaggPIDvalues(approachtunings[0], approachtunings[1], approachtunings[2])
         try:
             chime.theme('zelda')
@@ -90,12 +107,41 @@ class PIDProgram:
             self.controller.setPIDOverride()
         self.applystagetunings(self.currentstage)
 
-    def applystagetunings(self, stageindex):
-        """Apply the cons profile for `stageindex`: its own tunings if the
-        stage specifies one, otherwise the program's fallback `tunings`."""
+    def stagetuningsfor(self, stageindex):
+        """The cons profile for `stageindex`: its own tunings if the stage
+        specifies one, otherwise the program's fallback `tunings`."""
         stagespecific = self.stagetunings[stageindex] if stageindex < len(self.stagetunings) else None
-        kp, ki, kd = stagespecific if stagespecific else self.tunings
+        return tuple(stagespecific) if stagespecific else self.tunings
+
+    def applystagetunings(self, stageindex):
+        """Apply the cons profile for `stageindex`."""
+        kp, ki, kd = self.stagetuningsfor(stageindex)
         self.controller.setconsPIDvalues(kp, ki, kd)
+
+    def updateaggressiveprofile(self):
+        """Keep the agg slot from being the bare Kp=100 approach profile
+        once the temperature is within `aggressiveband` of the current
+        stage's target or has passed it - see the constructor's comment for
+        why. Cheap to call every tick: it only actually sends a command to
+        the MCU when the desired agg values change (mode flips, or the
+        matched cons profile itself changed, e.g. on a stage transition)."""
+        if not self.currentstage <= len(self.temperatures) - 1:
+            return
+        temp = self.controller.currenttemp
+        if temp <= 0:
+            return  # no reading yet - keep whatever is already loaded
+        target = self.temperatures[self.currentstage]
+        constunings = self.stagetuningsfor(self.currentstage)
+        if temp >= target - self.aggressiveband:
+            if self._aggmode != 'matched' or self._aggmatched != constunings:
+                self.controller.setaggPIDvalues(*constunings)
+                self._aggmode = 'matched'
+                self._aggmatched = constunings
+        else:
+            if self._aggmode != 'aggressive':
+                self.controller.setaggPIDvalues(*self.approachtunings)
+                self._aggmode = 'aggressive'
+                self._aggmatched = None
 
     def getprogress(self):
         """Snapshot of where the program is, for display in the GUI.
@@ -183,6 +229,7 @@ class PIDProgram:
                 print("Program ended, Set Point is :",self.controller.SP)
             return
         self.updateapproachramp()
+        self.updateaggressiveprofile()
         # The stage target counts as reached only once the ramp has handed the
         # final value to the MCU (during the ramp, SP < target and the water
         # tracking the ramp must not end the stage early).

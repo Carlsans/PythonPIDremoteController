@@ -703,6 +703,18 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
             "How far above target the relay's 'heater on' setpoint is allowed to swing.\n"
             "Tighten this (e.g. 5-7) when autotuning near a live, temperature-sensitive culture.")
         row.addWidget(self.autotunemarginentry)
+        row.addWidget(QtWidgets.QLabel("Max sensor temp (C):"))
+        self.autotunemaxtempentry = QtWidgets.QLineEdit("")
+        self.autotunemaxtempentry.setProperty("role", "digit")
+        self.autotunemaxtempentry.setMaximumWidth(scaled(60))
+        self.autotunemaxtempentry.setPlaceholderText("auto")
+        self.autotunemaxtempentry.setToolTip(
+            "Absolute safety ceiling for the sensor reading - the tune aborts immediately if\n"
+            "ever exceeded. A relay tune oscillates and some overshoot past target is normal,\n"
+            "not a fault, so set this to whatever is actually known to be safe for this pot/\n"
+            "setup (e.g. 95) rather than relying on the Margin above. Leave blank to fall back\n"
+            "to min(95, target + Margin).")
+        row.addWidget(self.autotunemaxtempentry)
         row.addWidget(QtWidgets.QLabel("Save as profile:"))
         self.autotunelabelentry = QtWidgets.QLineEdit()
         row.addWidget(self.autotunelabelentry)
@@ -723,6 +735,17 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         except ValueError:
             return 12.0
 
+    def autotunemaxtemp(self):
+        """The explicit 'Max sensor temp' override, or None if left blank
+        (falls back to yogurtdata.py's min(95, target+margin) default)."""
+        text = self.autotunemaxtempentry.text().strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
     def startautotune(self):
         if self.running:
             return
@@ -734,12 +757,20 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         if not 20 <= target <= 90:
             QtWidgets.QMessageBox.critical(self, "Autotune", "Target must be between 20 and 90 C.")
             return
+        maxtemp = self.autotunemaxtemp()
+        if self.autotunemaxtempentry.text().strip() and maxtemp is None:
+            QtWidgets.QMessageBox.critical(self, "Autotune", "Max sensor temp must be a number (or left blank).")
+            return
+        if maxtemp is not None and maxtemp <= target:
+            QtWidgets.QMessageBox.critical(self, "Autotune",
+                "Max sensor temp must be above the target - the relay needs room above target to work.")
+            return
         label = self.autotunelabelentry.text().strip()
         if not label:
             label = "autotune-" + str(target) + "C"
         self.runfermenter("Autotuning at " + str(target) + " C (profile '" + label + "')...",
                           mode='relayautotune', autotunetarget=target,
-                          autotunesafetymargin=self.autotunemargin(),
+                          autotunesafetymargin=self.autotunemargin(), autotunemaxtemp=maxtemp,
                           onautotunedone=lambda result: self.saveautotuneresult(label, result))
 
     def autotuneinplace(self):
@@ -767,7 +798,7 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         self._inplacepending = (resumestages, label)
         self.runfermenter("In-place autotune at " + str(target) + " C (profile '" + label + "')...",
                           mode='relayautotune', autotunetarget=target,
-                          autotunesafetymargin=self.autotunemargin(),
+                          autotunesafetymargin=self.autotunemargin(), autotunemaxtemp=self.autotunemaxtemp(),
                           onautotunedone=self._inplaceautotunedone)
 
     def _inplaceautotunedone(self, result):

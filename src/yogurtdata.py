@@ -99,8 +99,8 @@ def acquireportlock(port):
 
 class YogourtFermenter():
     def __init__(self, mode=None, stages=None, tunings=None, stagetunings=None,
-                 autotunetarget=None, autotunesafetymargin=12.0, onautotunedone=None,
-                 ontick=None, autorun=True, showgraph=True):
+                 autotunetarget=None, autotunesafetymargin=12.0, autotunemaxtemp=None,
+                 onautotunedone=None, ontick=None, autorun=True, showgraph=True):
         modes = ['pidprogram','relayautotune']
         if mode is None:
             mode = os.environ.get('YOGURT_MODE', modes[0])
@@ -179,13 +179,26 @@ class YogourtFermenter():
             if self.mode == 'relayautotune':
                 if autotunetarget is None:
                     autotunetarget = float(os.environ.get('YOGURT_AUTOTUNE_TARGET', self.SP))
-                # Bound the relay's "heater on" setpoint a bit above the
-                # target so high targets like 82 C work but nothing can
-                # approach boiling. A tighter margin caps how far the relay
-                # can swing above target, useful when autotuning near a
-                # live, temperature-sensitive culture rather than plain
-                # water.
-                maxsafe = min(95.0, autotunetarget + autotunesafetymargin)
+                if autotunemaxtemp is None and os.environ.get('YOGURT_AUTOTUNE_MAX_TEMP'):
+                    autotunemaxtemp = float(os.environ['YOGURT_AUTOTUNE_MAX_TEMP'])
+                if autotunemaxtemp is not None:
+                    # An explicit, absolute safety ceiling - a relay tune
+                    # oscillates and some overshoot past target is normal
+                    # and expected, not a fault; a max sensor temperature
+                    # set from what is actually known to be safe for THIS
+                    # pot/setup gives that oscillation real room to happen
+                    # without tripping a premature safety abort, unlike a
+                    # ceiling pinned tight to target+margin.
+                    maxsafe = autotunemaxtemp
+                else:
+                    # Fallback (unchanged default behaviour): bound the
+                    # relay's "heater on" setpoint a bit above the target so
+                    # high targets like 82 C work but nothing can approach
+                    # boiling. A tighter margin caps how far the relay can
+                    # swing above target, useful when autotuning near a
+                    # live, temperature-sensitive culture rather than plain
+                    # water.
+                    maxsafe = min(95.0, autotunetarget + autotunesafetymargin)
                 self.relayautotune = RelayAutotune(self, targettemp=autotunetarget,
                                                    maxsafetemp=maxsafe,
                                                    oncomplete=onautotunedone)

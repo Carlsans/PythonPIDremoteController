@@ -1010,20 +1010,35 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         this decoupled from every print() call site in yogurtdata.py /
         RelayAutotune.py / PIDProgram.py - anything any of them already
         prints lands here automatically, including a full traceback if one
-        of the try/except blocks below ever needs to print one."""
+        of the try/except blocks below ever needs to print one.
+
+        While a relay autotune is running, this shows its dedicated check
+        log (RelayAutotune.checklogpath) instead of the general run log -
+        the check log has the full, real-time, human-checkable arithmetic
+        behind Ku/Tu and every derived tuning rule, which is far more
+        detail than belongs in the general log. Falls back to the general
+        run log for every other mode."""
         now = time.time()
         if not force and now - self.lastlogtail < 1.0:
             return
         self.lastlogtail = now
         if fermenter is None:
             fermenter = self.fermenter
-        if fermenter is None or not getattr(fermenter, 'runlogpath', None):
+        if fermenter is None:
             return
-        path = fermenter.runlogpath
+        tuner = getattr(fermenter, 'relayautotune', None)
+        if fermenter.mode == 'relayautotune' and tuner is not None and getattr(tuner, 'checklogpath', None):
+            path = tuner.checklogpath
+            label = "PID tuning check log"
+        else:
+            path = getattr(fermenter, 'runlogpath', None)
+            label = "Log"
+        if not path:
+            return
         if path != self._logtailpath:
             self._logtailpath = path
             self._logtailpos = 0
-            self.logbox.setTitle("Log - " + path)
+            self.logbox.setTitle(label + " - " + path)
         try:
             with open(path, 'r') as f:
                 f.seek(self._logtailpos)

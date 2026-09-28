@@ -4,6 +4,7 @@ import fcntl
 import math
 import os
 import socket
+import sys
 import tempfile
 import time
 
@@ -27,6 +28,38 @@ def formatpid(value):
 
 class SingleInstanceError(Exception):
     pass
+
+
+class _TeeStream:
+    """Duplicates writes to several underlying streams.
+
+    Used to mirror every print() (and, wrapping stderr too, every uncaught
+    traceback) into a durable per-run log file in addition to the real
+    terminal. A relay autotune or a multi-day ferment can run long after any
+    terminal scrollback has been lost or the window closed, so this file is
+    the only place an error is guaranteed to still be readable afterwards -
+    see YogourtFermenter.runlogpath."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass  # a broken stream must never take another one down
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
 
 
 def acquireportlock(port):
@@ -74,84 +107,155 @@ class YogourtFermenter():
         self.mode = mode
         if self.mode not in modes:
             raise ValueError("Unknown mode '" + self.mode + "'. Valid modes: " + str(modes))
-        # Called on every loop iteration (several times per second); the GUI
-        # uses it to stay responsive while the loop runs.
-        self.ontick = ontick
-        self.ontickfailures = 0
-        self.stoprequested = False
-        # When False, this instance never touches matplotlib at all - used
-        # by GUIs that own their own plotting (e.g. the PyQt/pyqtgraph
-        # control panel) and read tempbysec/CV/etc. themselves instead.
-        self.showgraph = showgraph
-        self.tempbysec = []
-        self.CV = []
-        self.SPlist = []
-        self.PIDTermslist = []
-        self.errorlist = []
-        self.SP = 40
-        self.overridepid = None
-        self.currentSP = self.SP
-        self.currentCV = 0
-        self.currenttemp = 0
-        self.lasttemp = 0
-        self.sametempcount = 0
-        self.currentoutput = 0
-        self.currentPIDTerms = [0,0,0]
-        self.currentPIDSettings = [0,0,0]
-        self.starttime = datetime.datetime.now()
-        self.trimmedseconds = 0
-        # If no packet arrives for this long, the connection is considered
-        # dead and the UDP socket is recreated.
-        self.connectionlostseconds = float(os.environ.get('YOGURT_CONNECTION_TIMEOUT', 30))
-        self.lastpackettime = time.time()
-        # Proactively recreate the graph window this often (0 disables it).
-        # See recreategraph() for why this exists. Off by default: recreating
-        # raises/refocuses the window, which is disruptive on its own, and no
-        # freeze has actually been observed yet - use the GUI's "Refresh
-        # graph" button (or call recreategraph() directly) if one ever is.
-        self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 0))
-        self.graphrecreatecount = 0
-        # Set by requestgraphrefresh() (the GUI's "Refresh graph" button) and
-        # serviced from animate(), never called directly from the button's
-        # callback - see requestgraphrefresh() for why.
-        self.graphrefreshrequested = False
-        # Diagnostic log for the graph-freeze investigation: timing of every
-        # redraw call plus periodic heartbeats, so a run that visually froze
-        # can be correlated afterwards with what the process actually saw.
-        # Empty string disables it.
-        self.diaglogpath = os.environ.get('YOGURT_GRAPH_DIAG_LOG',
-                                          os.getcwd() + "/graph_diagnostics.log")
-        self.diagheartbeatseconds = float(os.environ.get('YOGURT_GRAPH_DIAG_HEARTBEAT_SECONDS', 5 * 60))
-        self.diagslowredrawms = float(os.environ.get('YOGURT_GRAPH_DIAG_SLOW_MS', 250))
-        self.diaglastheartbeat = 0.0
-        self.diagredrawcount = 0
-        self.diagmaxredrawms = 0.0
-        # Per-second-task pacing for the control loop; shared by the blocking
-        # listeningloop() and the PyQt GUI's timer-driven steponce() calls.
-        self._loop_lastsec = None
-        self._loopcount = 0
-        self.setPidvalues()
-        self.networkconf = NetworkConfiguration()
-        self.portlock = acquireportlock(self.networkconf.listen_port)
-        self.createsocket()
-        self.creategraph()
-        if self.mode == 'pidprogram':
-            self.pidprogram = PIDProgram(self, stages=stages, tunings=tunings, stagetunings=stagetunings)
-        if self.mode == 'relayautotune':
-            if autotunetarget is None:
-                autotunetarget = float(os.environ.get('YOGURT_AUTOTUNE_TARGET', self.SP))
-            # Bound the relay's "heater on" setpoint a bit above the target so
-            # high targets like 82 C work but nothing can approach boiling.
-            # A tighter margin caps how far the relay can swing above target,
-            # useful when autotuning near a live, temperature-sensitive
-            # culture rather than plain water.
-            maxsafe = min(95.0, autotunetarget + autotunesafetymargin)
-            self.relayautotune = RelayAutotune(self, targettemp=autotunetarget,
-                                               maxsafetemp=maxsafe,
-                                               oncomplete=onautotunedone)
+        self._setuprunlog()
+        try:
+            # Called on every loop iteration (several times per second); the
+            # GUI uses it to stay responsive while the loop runs.
+            self.ontick = ontick
+            self.ontickfailures = 0
+            self.stoprequested = False
+            # When False, this instance never touches matplotlib at all -
+            # used by GUIs that own their own plotting (e.g. the
+            # PyQt/pyqtgraph control panel) and read tempbysec/CV/etc.
+            # themselves instead.
+            self.showgraph = showgraph
+            self.tempbysec = []
+            self.CV = []
+            self.SPlist = []
+            self.PIDTermslist = []
+            self.errorlist = []
+            self.SP = 40
+            self.overridepid = None
+            self.currentSP = self.SP
+            self.currentCV = 0
+            self.currenttemp = 0
+            self.lasttemp = 0
+            self.sametempcount = 0
+            self.currentoutput = 0
+            self.currentPIDTerms = [0,0,0]
+            self.currentPIDSettings = [0,0,0]
+            self.starttime = datetime.datetime.now()
+            self.trimmedseconds = 0
+            # If no packet arrives for this long, the connection is
+            # considered dead and the UDP socket is recreated.
+            self.connectionlostseconds = float(os.environ.get('YOGURT_CONNECTION_TIMEOUT', 30))
+            self.lastpackettime = time.time()
+            # Proactively recreate the graph window this often (0 disables
+            # it). See recreategraph() for why this exists. Off by default:
+            # recreating raises/refocuses the window, which is disruptive on
+            # its own, and no freeze has actually been observed yet - use
+            # the GUI's "Refresh graph" button (or call recreategraph()
+            # directly) if one ever is.
+            self.graphrefreshseconds = float(os.environ.get('YOGURT_GRAPH_REFRESH_SECONDS', 0))
+            self.graphrecreatecount = 0
+            # Set by requestgraphrefresh() (the GUI's "Refresh graph"
+            # button) and serviced from animate(), never called directly
+            # from the button's callback - see requestgraphrefresh() for
+            # why.
+            self.graphrefreshrequested = False
+            # Diagnostic log for the graph-freeze investigation: timing of
+            # every redraw call plus periodic heartbeats, so a run that
+            # visually froze can be correlated afterwards with what the
+            # process actually saw. Empty string disables it.
+            self.diaglogpath = os.environ.get('YOGURT_GRAPH_DIAG_LOG',
+                                              os.getcwd() + "/graph_diagnostics.log")
+            self.diagheartbeatseconds = float(os.environ.get('YOGURT_GRAPH_DIAG_HEARTBEAT_SECONDS', 5 * 60))
+            self.diagslowredrawms = float(os.environ.get('YOGURT_GRAPH_DIAG_SLOW_MS', 250))
+            self.diaglastheartbeat = 0.0
+            self.diagredrawcount = 0
+            self.diagmaxredrawms = 0.0
+            # Per-second-task pacing for the control loop; shared by the
+            # blocking listeningloop() and the PyQt GUI's timer-driven
+            # steponce() calls.
+            self._loop_lastsec = None
+            self._loopcount = 0
+            self.setPidvalues()
+            self.networkconf = NetworkConfiguration()
+            self.portlock = acquireportlock(self.networkconf.listen_port)
+            self.createsocket()
+            self.creategraph()
+            if self.mode == 'pidprogram':
+                self.pidprogram = PIDProgram(self, stages=stages, tunings=tunings, stagetunings=stagetunings)
+            if self.mode == 'relayautotune':
+                if autotunetarget is None:
+                    autotunetarget = float(os.environ.get('YOGURT_AUTOTUNE_TARGET', self.SP))
+                # Bound the relay's "heater on" setpoint a bit above the
+                # target so high targets like 82 C work but nothing can
+                # approach boiling. A tighter margin caps how far the relay
+                # can swing above target, useful when autotuning near a
+                # live, temperature-sensitive culture rather than plain
+                # water.
+                maxsafe = min(95.0, autotunetarget + autotunesafetymargin)
+                self.relayautotune = RelayAutotune(self, targettemp=autotunetarget,
+                                                   maxsafetemp=maxsafe,
+                                                   oncomplete=onautotunedone)
+        except Exception:
+            # Construction failed partway through (e.g. SingleInstanceError
+            # from acquireportlock, or a bad stage list) - without this the
+            # stdout/stderr tee installed by _setuprunlog() would be left in
+            # place forever with no matching close, leaking the log file
+            # handle and, on a retry after fixing the problem, nesting a new
+            # tee on top of the still-installed one.
+            import traceback
+            traceback.print_exc()
+            self._closerunlog()
+            raise
 
         if autorun:
             self.listeningloop()
+
+    def _setuprunlog(self):
+        """Tee stdout/stderr into a durable, timestamped per-run log file.
+
+        A relay autotune or a ferment can run for hours, long past any
+        terminal's scrollback - and a GUI crash (e.g. an unhandled exception
+        inside a Qt slot) can take the terminal down with it before an error
+        is ever read. Everything already printed anywhere in this codebase
+        (including uncaught tracebacks, since stderr is wrapped too) now
+        lands in this file no matter what happens to the terminal or the
+        window. self.runlogpath is public so a GUI can show/tail it.
+        """
+        self.runlogpath = os.environ.get('YOGURT_RUN_LOG')
+        if not self.runlogpath:
+            logdir = os.path.join(os.getcwd(), "logs")
+            try:
+                os.makedirs(logdir, exist_ok=True)
+            except OSError:
+                logdir = os.getcwd()
+            self.runlogpath = os.path.join(
+                logdir, "run_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                + "_" + self.mode + ".log")
+        # Wrap whatever stdout/stderr currently are (not necessarily the
+        # real terminal - a second sequential instance in the same process,
+        # e.g. the GUI's "Autotune here" flow, would otherwise double-wrap
+        # an already-wrapped stream and still work, but restoring to
+        # "whatever was there before this instance" keeps that nesting
+        # correct regardless of how many instances stack).
+        self._prevstdout = sys.stdout
+        self._prevstderr = sys.stderr
+        self._runlogfile = None
+        try:
+            self._runlogfile = open(self.runlogpath, 'a', buffering=1)
+            sys.stdout = _TeeStream(self._prevstdout, self._runlogfile)
+            sys.stderr = _TeeStream(self._prevstderr, self._runlogfile)
+        except OSError as e:
+            self._runlogfile = None
+            print("Could not open run log file", self.runlogpath, "(continuing without it):", e)
+        print("=" * 70)
+        print("Run started", datetime.datetime.now().isoformat(sep=' ', timespec='seconds'),
+              "mode=" + self.mode, "| log:", self.runlogpath)
+        print("=" * 70)
+
+    def _closerunlog(self):
+        print("Run ended", datetime.datetime.now().isoformat(sep=' ', timespec='seconds'))
+        sys.stdout = getattr(self, '_prevstdout', sys.stdout)
+        sys.stderr = getattr(self, '_prevstderr', sys.stderr)
+        if getattr(self, '_runlogfile', None) is not None:
+            try:
+                self._runlogfile.close()
+            except OSError:
+                pass
+            self._runlogfile = None
 
     def safecall(self, label, fn, *args):
         """Call fn(*args), logging and swallowing any exception instead of
@@ -521,7 +625,19 @@ class YogourtFermenter():
             self.errorlist = self.errorlist[60*60:]
     def checkconnection(self):
         if time.time() - self.lastpackettime > self.connectionlostseconds:
-            print("No packet received for " + str(self.connectionlostseconds) + "s. Resetting UDP connection.")
+            msg = ("WARNING: no packet received for " + str(self.connectionlostseconds) + "s from "
+                   + self.networkconf.esp8266_ip + ":" + str(self.networkconf.esp8266_port)
+                   + ". Resetting UDP connection and re-requesting the setpoint.")
+            if self.currenttemp <= 0:
+                # Never got a single reading since this run started - the
+                # ESP is most likely unreachable (off, wrong IP, off the
+                # network) rather than a transient drop, and a mode like
+                # relayautotune won't even start its own timeout clock
+                # without a real temperature (see RelayAutotune.update()),
+                # so this would otherwise repeat silently forever.
+                msg += (" No temperature reading has been received AT ALL yet this run - check the "
+                       "ESP8266 is powered on and reachable at that address before waiting any longer.")
+            print(msg)
             self.createsocket()
             # Ask the MCU for a resync: if it is reachable again it will echo
             # its SetPoint and the normal resync logic takes over.
@@ -720,6 +836,7 @@ class YogourtFermenter():
                 plt.close(self.fig)
             except Exception:
                 pass
+        self._closerunlog()
 
 
 if __name__ == '__main__':

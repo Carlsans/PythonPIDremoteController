@@ -33,6 +33,7 @@ import copy
 import os
 import sys
 import time
+import traceback
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -306,6 +307,9 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         self._inplacepending = None
         self.lastplotupdate = 0.0
         self.lastprogressupdate = 0.0
+        self.lastlogtail = 0.0
+        self._logtailpath = None
+        self._logtailpos = 0
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -313,7 +317,12 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         controls = QtWidgets.QVBoxLayout()
         outer.addLayout(controls, stretch=0)
         self.plotwidget = self.buildplots()
-        outer.addWidget(self.plotwidget, stretch=1)
+        rightsplitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        rightsplitter.addWidget(self.plotwidget)
+        rightsplitter.addWidget(self.buildlogsection())
+        rightsplitter.setStretchFactor(0, 4)
+        rightsplitter.setStretchFactor(1, 1)
+        outer.addWidget(rightsplitter, stretch=1)
 
         controls.addWidget(self.buildstagesection())
         controls.addWidget(self.buildpidsection())
@@ -656,7 +665,8 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
 
     def saveautotuneresult(self, label, result):
         if result is None:
-            self.setstatus("Autotune aborted - nothing saved. Check the terminal output.")
+            self.setstatus("Autotune aborted - no usable oscillation data was measured, nothing "
+                           "saved. See the Log panel below for why.")
             return
         tunings = result[result.get("applied", "ziegler_nichols_pi")]
         self.settings["pid_profiles"][label] = {
@@ -664,6 +674,12 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         self.settings["active_profile"] = label
         self.store.save(self.settings)
         self.refreshprofiles()
+        if result.get("aborted_reason"):
+            self.setstatus("Autotune stopped early (" + result["aborted_reason"] + ") - saved '"
+                           + label + "' anyway, computed from " + str(result.get("cycles_used", "?"))
+                           + "/" + str(result.get("cycles_target", "?")) + " cycle(s). These tunings "
+                           "are less certain than a full run - review before trusting them fully.")
+            return
         self.setstatus("Autotune done: saved profile '" + label + "'. Now holding the target temperature.")
 
     # ------------------------------------------------------------------
@@ -871,16 +887,35 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
             except Exception as e:
                 print("closelistening error (ignored):", repr(e))
             print("Listening loop stopped.")
+            self._pumplogtail(fermenter, force=True)  # catch the final lines before self.fermenter -> None
             self._fermenterstopped()
             if self.closing:
                 QtWidgets.QApplication.instance().quit()
             return
+        # Each step below is independently guarded: previously an exception
+        # from updateprogress()/updateplots() propagated straight out of
+        # this QTimer slot uncaught - PyQt5 can abort the whole process on
+        # an unhandled exception inside a slot, which would silently kill a
+        # multi-hour autotune with nothing but a traceback that scrolled
+        # past in a terminal nobody was watching. Catching here keeps the
+        # run (and this window) alive and puts the full traceback in the
+        # log panel/file instead.
         try:
             fermenter.steponce(blocking=False, runontick=False)
-        except Exception as e:
-            print("Fermenter step error (ignored):", repr(e))
-        self.updateprogress()
-        self.updateplots()
+        except Exception:
+            print("ERROR: fermenter step failed (run continues):")
+            traceback.print_exc()
+        try:
+            self.updateprogress()
+        except Exception:
+            print("ERROR: progress display update failed (run continues):")
+            traceback.print_exc()
+        try:
+            self.updateplots()
+        except Exception:
+            print("ERROR: plot update failed (run continues):")
+            traceback.print_exc()
+        self._pumplogtail()
         # Heartbeat to the diagnostics log so a future freeze is diagnosable
         # at a glance: if the window ever stops updating while these keep
         # being written, the timer is still firing (a compositor/WM-side
@@ -908,10 +943,28 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
             self.setstatus("Stopped. The MCU keeps its last setpoint unless you used 'Stop & heater off'.")
             self.progresslabel.setText("Idle - nothing running")
 
+    def _capturepartialautotune(self, fermenter, reason):
+        """If an autotune is stopped mid-run, compute tunings from whatever
+        complete cycles were already measured instead of just discarding
+        them - a relay autotune can take tens of minutes per cycle, so
+        stopping early used to mean getting nothing at all back. Turns the
+        heater off too: an in-progress autotune has no steady setpoint to
+        'keep heating' at (the relay is mid-swing, full on or full off),
+        unlike a normal program hold."""
+        tuner = getattr(fermenter, 'relayautotune', None)
+        if fermenter.mode == 'relayautotune' and tuner is not None and tuner.state == 'relay':
+            tuner.abort(reason)
+            fermenter.setSP(1)
+            return True
+        return False
+
     def stop(self, heateroff=False):
         if self.fermenter is None:
             return
-        if heateroff:
+        capturedpartial = self._capturepartialautotune(self.fermenter, "stopped by user")
+        if capturedpartial:
+            self.setstatus("Stopping autotune - computing tunings from whatever cycles were measured...")
+        elif heateroff:
             self.fermenter.setSP(1)
             self.setstatus("Heater off requested, stopping...")
         self.fermenter.stoprequested = True
@@ -927,6 +980,61 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
         self.progresslabel.setWordWrap(True)
         layout.addWidget(self.progresslabel)
         return box
+
+    # ------------------------------------------------------------------
+    # Log panel
+    # ------------------------------------------------------------------
+    def buildlogsection(self):
+        """A persistent, scrollable log panel - unlike the status line above
+        (which a later message overwrites) or the terminal (which scrolls
+        past and disappears when the window/terminal closes), this keeps
+        every line visible for as long as the window is open, and every line
+        is also mirrored to the per-run log file on disk (see
+        YogourtFermenter.runlogpath / _pumplogtail below) so it survives
+        even a hard crash of this window."""
+        self.logbox = QtWidgets.QGroupBox("Log")
+        layout = QtWidgets.QVBoxLayout(self.logbox)
+        self.logview = QtWidgets.QPlainTextEdit()
+        self.logview.setReadOnly(True)
+        self.logview.setMaximumBlockCount(4000)
+        monofont = QtGui.QFont("monospace")
+        monofont.setStyleHint(QtGui.QFont.Monospace)
+        monofont.setPointSize(max(int(UIFONTPT) - 3, 8))
+        self.logview.setFont(monofont)
+        layout.addWidget(self.logview)
+        return self.logbox
+
+    def _pumplogtail(self, fermenter=None, force=False):
+        """Tail the current run's log file into the log panel (~1x/second).
+        Reading the file rather than pushing lines through a callback keeps
+        this decoupled from every print() call site in yogurtdata.py /
+        RelayAutotune.py / PIDProgram.py - anything any of them already
+        prints lands here automatically, including a full traceback if one
+        of the try/except blocks below ever needs to print one."""
+        now = time.time()
+        if not force and now - self.lastlogtail < 1.0:
+            return
+        self.lastlogtail = now
+        if fermenter is None:
+            fermenter = self.fermenter
+        if fermenter is None or not getattr(fermenter, 'runlogpath', None):
+            return
+        path = fermenter.runlogpath
+        if path != self._logtailpath:
+            self._logtailpath = path
+            self._logtailpos = 0
+            self.logbox.setTitle("Log - " + path)
+        try:
+            with open(path, 'r') as f:
+                f.seek(self._logtailpos)
+                chunk = f.read()
+                self._logtailpos = f.tell()
+        except OSError:
+            return
+        if chunk:
+            self.logview.appendPlainText(chunk.rstrip('\n'))
+            scrollbar = self.logview.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def updateprogress(self):
         now = time.time()
@@ -1150,6 +1258,7 @@ class YogurtGUIQt(QtWidgets.QMainWindow):
             # which ends app.exec_() and closes the window.
             event.ignore()
             if self.fermenter is not None:
+                self._capturepartialautotune(self.fermenter, "window closed")
                 self.fermenter.stoprequested = True
 
 

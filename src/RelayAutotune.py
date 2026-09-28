@@ -32,8 +32,8 @@ class RelayAutotune:
     RELAY_KP = 10000.0   # pure-P gain that saturates the MCU PID either way
 
     def __init__(self, controller, targettemp=40.0, hysteresis=0.15,
-                 cyclestomeasure=4, skipcycles=2, maxsafetemp=60.0,
-                 timeoutseconds=4 * 60 * 60, timesource=time.time,
+                 cyclestomeasure=4, skipcycles=1, maxsafetemp=60.0,
+                 timeoutseconds=12 * 60 * 60, timesource=time.time,
                  resultsfile="autotune_results.txt", oncomplete=None):
         self.controller = controller
         self.targettemp = targettemp
@@ -142,25 +142,50 @@ class RelayAutotune:
         self.currentmax = None
         self.currentmin = None
         if len(self.cyclepeaks) >= self.skipcycles + self.cyclestomeasure:
-            self.computetunings()
+            self.finish()
+
+    def finish(self):
+        """Full, successful completion: the configured number of cycles was
+        measured. Compute tunings, push them to the controller and hold the
+        target. If the final measurement is somehow degenerate (e.g. a flat
+        sensor reading), fall back to abort() so any earlier partial data
+        still isn't wasted."""
+        if not self.computetunings():
+            self.abort("degenerate oscillation in the final measurement")
+            return
+        chosen = self.result[self.result['applied']]
+        self.controller.setAllPID(chosen['Kp'], chosen['Ki'], chosen['Kd'])
+        self.controller.setSP(self.targettemp)
+        self.state = 'done'
+        if self.oncomplete is not None:
+            self.oncomplete(self.result)
 
     # ------------------------------------------------------------------
     # Tuning computation
     # ------------------------------------------------------------------
-    def computetunings(self):
+    def computetunings(self, extra=None):
+        """Compute Ku/Tu and the derived tunings from whatever complete
+        cycles are available beyond skipcycles - not necessarily the full
+        cyclestomeasure count. Sets self.result and returns True if there
+        was at least one usable cycle; returns False (leaving self.result
+        untouched) otherwise. Callers decide what a partial vs a full result
+        means (see finish() and abort()); this method has no side effects on
+        self.state or the controller, so it is safe to call speculatively.
+        """
         peaks = self.cyclepeaks[self.skipcycles:]
         troughs = self.cycletroughs[self.skipcycles:]
         periods = []
         for i in range(len(self.switchtimes) - 1):
             periods.append(self.switchtimes[i + 1] - self.switchtimes[i])
         periods = periods[self.skipcycles:]
+        if not peaks or not troughs or not periods:
+            return False
 
         Tu = sum(periods) / len(periods)
         amplitudes = [(p - t) / 2.0 for p, t in zip(peaks, troughs)]
         a = sum(amplitudes) / len(amplitudes)
         if a <= 0 or Tu <= 0:
-            self.abort("degenerate oscillation (amplitude=" + str(a) + ", period=" + str(Tu) + ")")
-            return
+            return False
         if (self.observedmaxout is not None and self.observedminout is not None
                 and self.observedmaxout - self.observedminout > 1.0):
             d = (self.observedmaxout - self.observedminout) / 2.0
@@ -188,8 +213,14 @@ class RelayAutotune:
             'tyreus_luyben_pi': tlpi,
             'no_overshoot': noovershoot,
             'applied': 'ziegler_nichols_pi',
+            'cycles_used': len(amplitudes),
+            'cycles_target': self.cyclestomeasure,
         }
-        print("Relay autotune finished.")
+        if extra:
+            self.result.update(extra)
+        complete = len(amplitudes) >= self.cyclestomeasure
+        print("Relay autotune " + ("finished" if complete else "computed PARTIAL tunings")
+              + " (" + str(len(amplitudes)) + "/" + str(self.cyclestomeasure) + " cycle(s) measured).")
         print("  Ultimate gain Ku =", Ku, " ultimate period Tu =", Tu, "s, amplitude =", a)
         print("  Ziegler-Nichols     :", zn)
         print("  Ziegler-Nichols PI  :", znpi, "(applied)")
@@ -197,13 +228,7 @@ class RelayAutotune:
         print("  Tyreus-Luyben PI    :", tlpi)
         print("  No-overshoot        :", noovershoot)
         self.savetofile()
-
-        chosen = znpi
-        self.controller.setAllPID(chosen['Kp'], chosen['Ki'], chosen['Kd'])
-        self.controller.setSP(self.targettemp)
-        self.state = 'done'
-        if self.oncomplete is not None:
-            self.oncomplete(self.result)
+        return True
 
     def savetofile(self):
         try:
@@ -224,7 +249,24 @@ class RelayAutotune:
                 "target": self.targettemp}
 
     def abort(self, reason):
+        """Stop the tune early (timeout, safety limit, or a caller asking to
+        stop - e.g. the GUI's Stop button). Relay autotune is slow (tens of
+        minutes per cycle), so rather than discarding everything, compute
+        tunings from whatever complete cycles were already measured beyond
+        skipcycles - even just one - and report them via oncomplete() as a
+        'partial' result (result['cycles_used'] < result['cycles_target']).
+        oncomplete(None) only happens when there is truly nothing usable."""
+        if self.state in ('done', 'aborted'):
+            return  # already finished/aborted - never double-report
         self.state = 'aborted'
-        print("Relay autotune ABORTED:", reason)
+        if self.computetunings(extra={'aborted_reason': reason}):
+            print("Relay autotune ABORTED (" + reason + ") but " + str(self.result['cycles_used'])
+                  + "/" + str(self.result['cycles_target']) + " cycle(s) were measured - partial "
+                  "tunings were computed (result['cycles_used'], result['aborted_reason']). These "
+                  "were NOT pushed to the controller automatically - review before trusting them fully.")
+            if self.oncomplete is not None:
+                self.oncomplete(self.result)
+            return
+        print("Relay autotune ABORTED:", reason, "- no usable cycles were measured, nothing computed.")
         if self.oncomplete is not None:
             self.oncomplete(None)

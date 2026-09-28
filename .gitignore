@@ -17,3 +17,4 @@ autotune_results.txt
 src/autotune_results.txt
 src/yogurtpid2.csv
 *.csv
+logs/

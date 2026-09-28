@@ -373,7 +373,8 @@ class YogurtGUI:
     def saveautotuneresult(self, label, result):
         """Store an autotune result as a named profile (called when it finishes)."""
         if result is None:
-            self.setstatus("Autotune aborted - nothing saved. Check the terminal output.")
+            self.setstatus("Autotune aborted - no usable oscillation data was measured, nothing "
+                           "saved. Check the terminal / run log for why.")
             return
         tunings = result[result.get("applied", "ziegler_nichols_pi")]
         self.settings["pid_profiles"][label] = {
@@ -381,6 +382,12 @@ class YogurtGUI:
         self.settings["active_profile"] = label
         self.store.save(self.settings)
         self.refreshprofiles()
+        if result.get("aborted_reason"):
+            self.setstatus("Autotune stopped early (" + result["aborted_reason"] + ") - saved '"
+                           + label + "' anyway, computed from " + str(result.get("cycles_used", "?"))
+                           + "/" + str(result.get("cycles_target", "?")) + " cycle(s). Review before "
+                           "trusting these tunings fully.")
+            return
         self.setstatus("Autotune done: saved profile '" + label + "'. Now holding the target temperature.")
 
     # ------------------------------------------------------------------
@@ -632,10 +639,24 @@ class YogurtGUI:
         self.updateprogress()
         self.root.update()
 
+    def _capturepartialautotune(self, fermenter, reason):
+        """If an autotune is stopped mid-run, compute tunings from whatever
+        complete cycles were already measured instead of discarding them -
+        see YogurtGUIQt.py's identical helper for the full rationale."""
+        tuner = getattr(fermenter, 'relayautotune', None)
+        if fermenter.mode == 'relayautotune' and tuner is not None and tuner.state == 'relay':
+            tuner.abort(reason)
+            fermenter.setSP(1)
+            return True
+        return False
+
     def stop(self, heateroff=False):
         if self.fermenter is None:
             return
-        if heateroff:
+        capturedpartial = self._capturepartialautotune(self.fermenter, "stopped by user")
+        if capturedpartial:
+            self.setstatus("Stopping autotune - computing tunings from whatever cycles were measured...")
+        elif heateroff:
             self.fermenter.setSP(1)
             self.setstatus("Heater off requested, stopping...")
         self.fermenter.stoprequested = True
